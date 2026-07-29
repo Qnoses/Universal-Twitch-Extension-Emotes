@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      2.1
+// @version      2.3
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -81,14 +81,20 @@
     // Structural detection on non-Twitch origins. Set false to restrict the
     // script to Twitch-served documents (main site + embed/popout iframes).
     genericDetection: true,
-    // Small status pill in the corner of the chat frame.
-    showHud: true,
+    // Hovering an emote shows a small card with its name and provider,
+    // matching the chat box preview. false falls back to a plain tooltip.
+    hoverCard: true,
+    // Status readout and controls. 'auto' shows the corner pill only where the
+    // emote picker isn't available to host them; true/false force it.
+    showHud: 'auto',
     // Add provider sections to Twitch's native emote picker (twitch.tv only).
     pickerSections: true,
     // Also list the three global sets in the picker, not just channel sets.
     pickerIncludeGlobals: false,
     // Add a category icon per provider to the picker's right-hand nav rail.
     pickerNavIcons: true,
+    // Emote counts, channel, and the set/reload controls, shown in the picker.
+    pickerPanel: true,
     // Draw emotes over their codes in the chat input as you type.
     composerPreview: true,
     // Show a preview card above the input for the code under the caret.
@@ -104,6 +110,14 @@
   /* ══════════════════════════════════════════════════════════════════════════
    * 2. PLATFORM SHIMS
    * ════════════════════════════════════════════════════════════════════════ */
+
+  // Display names. Never show the internal provider keys: "bttv channel" is
+  // not a thing anyone calls it.
+  const PROVIDER_LABEL = {
+    '7tv-channel': '7TV',          '7tv-global': '7TV Global',
+    'bttv-channel': 'BetterTTV',   'bttv-global': 'BetterTTV Global',
+    'ffz-channel': 'FrankerFaceZ', 'ffz-global': 'FrankerFaceZ Global',
+  };
 
   const log = (...a) => CONFIG.debug && console.log('%c[UTE]', 'color:#8b5cf6', ...a);
   const warn = (...a) => console.warn('[UTE]', ...a);
@@ -532,6 +546,45 @@
     .ute-emote.ute-broken { display: none; }
   `);
 
+  /**
+   * Replaces the browser's `title` tooltip on rendered emotes with the same
+   * card the chat box uses, so an emote reads the same wherever you meet it.
+   */
+  const Tooltip = {
+    el: null,
+
+    ensure() {
+      if (this.el && this.el.isConnected) return this.el;
+      const el = document.createElement('div');
+      el.className = 'ute-card ute-tip';
+      el.setAttribute('aria-hidden', 'true');
+      el.innerHTML = '<img alt=""><span class="ute-card-code"></span>' +
+                     '<span class="ute-card-src"></span>';
+      document.body.appendChild(el);
+      this.el = el;
+      return el;
+    },
+
+    show(img) {
+      const el = this.ensure();
+      el.querySelector('img').src = img.currentSrc || img.src;
+      el.querySelector('.ute-card-code').textContent = img.dataset.uteCode || img.alt || '';
+      el.querySelector('.ute-card-src').textContent = img.dataset.uteSrc || '';
+      el.classList.add('ute-on');            // measure only once it's laid out
+
+      const r = img.getBoundingClientRect();
+      const vw = document.documentElement.clientWidth || window.innerWidth;
+      let top = r.top - el.offsetHeight - 6;
+      if (top < 4) top = r.bottom + 6;       // no room above: flip below
+      const left = Math.max(4, Math.min(
+        r.left + r.width / 2 - el.offsetWidth / 2, vw - el.offsetWidth - 4));
+      el.style.top = Math.round(top) + 'px';
+      el.style.left = Math.round(left) + 'px';
+    },
+
+    hide() { if (this.el) this.el.classList.remove('ute-on'); },
+  };
+
   const blobCache = new Map();
 
   /**
@@ -559,10 +612,11 @@
     img.src = emote.url;
     if (emote.srcset) img.srcset = emote.srcset;
     img.alt = emote.code;               // keeps text selection/copy intact
-    img.title = `${emote.code} — ${emote.provider.replace('-', ' ')}`;
     img.loading = 'lazy';
     img.decoding = 'async';
     img.dataset.uteCode = emote.code;
+    img.dataset.uteSrc = PROVIDER_LABEL[emote.provider] || emote.provider;
+    if (!CONFIG.hoverCard) img.title = `${emote.code} — ${img.dataset.uteSrc}`;
     if (emote.height) img.style.maxHeight = Math.min(emote.height, CONFIG.maxHeight) + 'px';
     img.addEventListener('error', () => repairViaBlob(img, emote), { once: true });
     return img;
@@ -625,8 +679,10 @@
       if (el.dataset.uteDone === '1') return;
       if (!Store.map.size) return;
 
-      // Never touch inputs, links, or the emote nodes we already made.
-      if (el.closest('input, textarea, [contenteditable="true"], .ute-wrap')) return;
+      // Never touch inputs, links, or the emote nodes we already made. The
+      // whole of .chat-input is off limits: the composer owns its own overlay
+      // and the emote picker is not chat.
+      if (el.closest('input, textarea, [contenteditable="true"], .ute-wrap, .chat-input')) return;
 
       const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
         acceptNode(n) {
@@ -678,6 +734,12 @@
         }
       };
 
+      if (CONFIG.hoverCard) {
+        const at = e => (e.target && e.target.closest ? e.target.closest('img.ute-emote') : null);
+        root.addEventListener('mouseover', e => { const i = at(e); if (i) Tooltip.show(i); });
+        root.addEventListener('mouseout', e => { if (at(e)) Tooltip.hide(); });
+      }
+
       // Seed with whatever is already on screen.
       const existing = messageSelector ? root.querySelectorAll(messageSelector) : root.children;
       Array.from(existing).forEach(m => this.processMessage(m));
@@ -720,14 +782,24 @@
     {
       name: 'twitch',
       test: () => /(^|\.)twitch\.tv$/i.test(location.hostname),
+      // The message list is not the only place Twitch renders chat text.
+      // Pinned messages, hype chat and other community highlights sit in a
+      // sibling stack above it, so the root is the whole chat room and
+      // .chat-input (composer + emote picker) is excluded per-node instead.
       containers: [
+        '.chat-room__content',
         '.chat-scrollable-area__message-container',
         '[data-test-selector="chat-scrollable-area__message-container"]',
         '.chat-list--default .simplebar-content',
         '.chat-room__content .chat-list',
         '[data-a-target="chat-scroller"]',
       ],
-      messages: '.chat-line__message, .chat-line__status, .user-notice-line, .vod-message, [data-a-target="chat-line-message"]',
+      // Every Twitch message form — ordinary lines, notices, pinned cards —
+      // marks its text with data-a-target="chat-message-text", so matching
+      // that covers forms this script has never seen.
+      messages: '.chat-line__message, .chat-line__status, .user-notice-line, .vod-message, ' +
+                '[data-a-target="chat-line-message"], [data-a-target="chat-message-text"], ' +
+                '.pinned-chat__message, .community-highlight',
     },
     {
       name: 'kapchat',
@@ -853,12 +925,12 @@
   // Colours are chosen for contrast against the picker's dark background.
   // They are not official brand colours, just distinguishable section markers.
   const PICKER_GROUPS = [
-    { provider: '7tv-channel',  label: '7TV Channel Emotes',           letter: '7', color: '#3d5a9e' },
-    { provider: 'bttv-channel', label: 'BetterTTV Channel Emotes',     letter: 'B', color: '#8f3030' },
-    { provider: 'ffz-channel',  label: 'FrankerFaceZ Channel Emotes',  letter: 'F', color: '#3f4a63' },
-    { provider: '7tv-global',   label: '7TV Global Emotes',            letter: '7', color: '#3d5a9e', global: true },
-    { provider: 'bttv-global',  label: 'BetterTTV Global Emotes',      letter: 'B', color: '#8f3030', global: true },
-    { provider: 'ffz-global',   label: 'FrankerFaceZ Global Emotes',   letter: 'F', color: '#3f4a63', global: true },
+    { provider: '7tv-channel',  label: '7TV Channel Emotes',          tag: '7TV',  letter: '7', color: '#3d5a9e' },
+    { provider: 'bttv-channel', label: 'BetterTTV Channel Emotes',    tag: 'BTTV', letter: 'B', color: '#8f3030' },
+    { provider: 'ffz-channel',  label: 'FrankerFaceZ Channel Emotes', tag: 'FFZ',  letter: 'F', color: '#3f4a63' },
+    { provider: '7tv-global',   label: '7TV Global Emotes',           tag: '7TV',  letter: '7', color: '#3d5a9e', global: true },
+    { provider: 'bttv-global',  label: 'BetterTTV Global Emotes',     tag: 'BTTV', letter: 'B', color: '#8f3030', global: true },
+    { provider: 'ffz-global',   label: 'FrankerFaceZ Global Emotes',  tag: 'FFZ',  letter: 'F', color: '#3f4a63', global: true },
   ];
 
   function badgeIcon(letter, color) {
@@ -906,6 +978,7 @@
   const Picker = {
     hostObserver: null,
     sections: [],
+    panel: null,
     query: '',
     queued: false,
 
@@ -932,6 +1005,7 @@
 
     reset() {
       this.sections = [];
+      this.panel = null;
       if (this.hostObserver) { this.hostObserver.disconnect(); this.hostObserver = null; }
     },
 
@@ -939,7 +1013,11 @@
       const picker = document.querySelector(PSEL.picker);
       if (!picker) { this.sections = []; return; }
       if (!Store.map.size) return;
-      if (this.sections.length && this.sections.every(n => picker.contains(n))) return;
+      if (this.sections.length && this.sections.every(n => picker.contains(n))) {
+        this.reanchor(picker);
+        this.injectNav(picker, this.groups());   // no-op once correctly placed
+        return;
+      }
       this.sections = [];
       try { this.inject(picker); } catch (e) { warn('picker injection failed:', e.message); }
     },
@@ -993,14 +1071,23 @@
       // refresh() drops our references, but the nodes are still in Twitch's
       // DOM. Without this the sections double on every refresh — and worse,
       // templates() would start cloning our own clones.
-      picker.querySelectorAll('[data-ute-section]').forEach(n => n.remove());
+      picker.querySelectorAll('[data-ute-section], [data-ute-panel]').forEach(n => n.remove());
+      this.panel = null;
 
       const groups = this.groups();
       if (!groups.length) return;
       const tpl = this.templates(picker);
       if (!tpl || !tpl.container) return;
 
-      let ref = tpl.blocks[tpl.blocks.length - 1];   // last native section
+      let ref = this.anchorFor(picker) || tpl.blocks[tpl.blocks.length - 1];
+
+      if (CONFIG.pickerPanel) {
+        const panel = this.buildPanel();
+        ref.parentNode.insertBefore(panel, ref.nextSibling);
+        this.panel = panel;
+        ref = panel;
+      }
+
       for (const group of groups) {
         const node = this.buildSection(tpl, group);
         if (!node) continue;
@@ -1013,6 +1100,87 @@
       this.wireSearch(picker);
       this.injectNav(picker, groups);
       log('picker: added', this.sections.length, 'sections');
+    },
+
+    /**
+     * The channel's own section is the first one whose header carries an
+     * avatar — "Frequently Used" has none, and other channels' sections mount
+     * later and further down. Anchoring to it survives the race where the
+     * picker's first mutation fires before Twitch has rendered it, which
+     * otherwise landed these sections above the channel's own emotes.
+     */
+    anchorFor(picker) {
+      const blocks = [];
+      for (const header of picker.querySelectorAll(PSEL.header)) {
+        if (header.closest('[data-ute-section]')) continue;
+        const block = header.parentElement && header.parentElement.parentElement;
+        if (block && block.querySelector(PSEL.grid) && !blocks.includes(block)) blocks.push(block);
+      }
+      return blocks.find(b => b.querySelector(PSEL.header + ' img')) || blocks[blocks.length - 1] || null;
+    },
+
+    /** Twitch mounts sections progressively; keep our position correct. */
+    reanchor(picker) {
+      const anchor = this.anchorFor(picker);
+      if (!anchor || anchor === this.sections[0]) return;
+      const head = this.panel || this.sections[0];
+      if (head.previousElementSibling === anchor) return;
+      let ref = anchor;
+      for (const node of [this.panel, ...this.sections]) {
+        if (!node) continue;
+        ref.parentNode.insertBefore(node, ref.nextSibling);
+        ref = node;
+      }
+      log('picker: re-anchored below the channel section');
+    },
+
+    /**
+     * The status readout and its controls, hosted here rather than floating
+     * over the chat UI where they collided with Twitch's own buttons.
+     */
+    buildPanel() {
+      const panel = document.createElement('div');
+      panel.className = 'ute-panel';
+      panel.dataset.utePanel = '1';
+
+      const c = Store.counts;
+      const total = n => n || 0;
+      const counts = document.createElement('span');
+      counts.className = 'ute-panel-counts';
+      counts.textContent = [
+        `7TV ${total(c['7tv-channel']) + total(c['7tv-global'])}`,
+        `BetterTTV ${total(c['bttv-channel']) + total(c['bttv-global'])}`,
+        `FrankerFaceZ ${total(c['ffz-channel']) + total(c['ffz-global'])}`,
+      ].join('  ·  ');
+
+      const channel = document.createElement('span');
+      channel.className = 'ute-panel-channel';
+      channel.textContent = Store.channel ? `#${Store.channel}` : 'channel not detected';
+
+      const button = (label, onClick) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.textContent = label;
+        b.addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); onClick(); });
+        return b;
+      };
+
+      panel.append(
+        counts, channel,
+        button('Set channel', () => {
+          const v = prompt('Twitch channel for this page:', Store.channel || '');
+          if (!v) return;
+          const login = v.trim().replace(/^#/, '').toLowerCase();
+          gmSet(`ute:manual:${location.hostname}${location.pathname}`, login);
+          Store.load(login);
+        }),
+        button('Reload emotes', () => {
+          gmSet(`ute:emotes:${Store.channel || '__global__'}`, null);
+          Store.signature = '';
+          Store.load(Store.channel);
+        }),
+      );
+      return panel;
     },
 
     buildSection(tpl, group) {
@@ -1121,47 +1289,80 @@
       }
     },
 
+    /** The channel's own tab: the one avatar-style item we can safely clone. */
+    navChannelTab(toolbar) {
+      const button = toolbar.querySelector('[data-a-target="CHANNEL_EMOTES"]');
+      if (!button) return null;
+      let node = button;
+      while (node && node.parentElement !== toolbar) node = node.parentElement;
+      return node && node.querySelector('img') ? node : null;
+    },
+
+    /**
+     * Called on every check, not just on injection. The rail is a different
+     * React subtree from the sections list, and re-renders on its own — which
+     * is why these could vanish while the sections they point at survived.
+     *
+     * It also has to wait for the channel tab. Cloning whatever happened to be
+     * there first produced three copies of the clock icon at the bottom of the
+     * rail: the "ghost entries".
+     */
     injectNav(picker, groups) {
       if (!CONFIG.pickerNavIcons) return;
       const toolbar = picker.querySelector(PSEL.nav);
       if (!toolbar) return;
-      toolbar.querySelectorAll('[data-ute-nav]').forEach(n => n.remove());
 
-      // Prefer an avatar-style tab to clone; the icon-style ones hold an SVG.
-      const source = Array.from(toolbar.children).find(c => c.querySelector('img'))
-        || toolbar.lastElementChild;
-      if (!source) return;
+      const source = this.navChannelTab(toolbar);
+      if (!source) return;                       // too early; retry next check
 
+      const existing = toolbar.querySelectorAll('[data-ute-nav]');
+      const placed = existing.length === groups.length
+        && existing[0].previousElementSibling === source;
+      if (placed) return;                        // already correct, do nothing
+      existing.forEach(n => n.remove());
+
+      const avatar = source.querySelector('img');
+      let ref = source;                          // sit directly below the channel
       for (const group of groups) {
         const item = source.cloneNode(true);
+        item.classList.add('ute-nav-item');
         item.dataset.uteNav = group.provider;
         item.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+
+        // Reuse the channel's own icon, tagged in the corner, so these read as
+        // siblings of Twitch's tabs rather than foreign objects.
         const img = item.querySelector('img');
         if (img) {
-          img.src = badgeIcon(group.letter, group.color);
+          img.src = (avatar && avatar.src) || badgeIcon(group.letter, group.color);
           img.removeAttribute('srcset');
           img.alt = group.label;
         }
+        const tag = document.createElement('span');
+        tag.className = 'ute-nav-tag';
+        tag.textContent = group.tag;
+        item.appendChild(tag);
+
         const button = item.querySelector('button');
         if (button) {
           button.setAttribute('aria-label', group.label);
           button.setAttribute('aria-current', 'false');
           button.setAttribute('data-a-target', 'ute-emote-nav');
+          // Resolved at click time: a rebuild replaces the section node, and a
+          // reference captured here would point at a detached one.
           button.addEventListener('click', ev => {
             ev.preventDefault();
             ev.stopPropagation();
-            if (group.node) group.node.scrollIntoView({ block: 'start', behavior: 'smooth' });
+            const target = picker.querySelector(`[data-ute-section="${group.provider}"]`);
+            if (target && typeof target.scrollIntoView === 'function') {
+              target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+            }
           });
         }
-        toolbar.appendChild(item);
+        ref.parentNode.insertBefore(item, ref.nextSibling);
+        ref = item;
       }
+      log('picker: nav tabs placed below the channel tab');
     },
-  };
-
-  const PROVIDER_LABEL = {
-    '7tv-channel': '7TV', '7tv-global': '7TV global',
-    'bttv-channel': 'BetterTTV', 'bttv-global': 'BetterTTV global',
-    'ffz-channel': 'FrankerFaceZ', 'ffz-global': 'FrankerFaceZ global',
   };
 
   /**
@@ -1241,9 +1442,8 @@
       max-width: 100%; max-height: 100%;
       object-fit: contain;
     }
-    .ute-bubble {
-      position: absolute; bottom: calc(100% + 6px); inset-inline-start: 10px;
-      z-index: 20; display: none; align-items: center; gap: 8px;
+    .ute-card {
+      display: none; align-items: center; gap: 8px;
       padding: 5px 9px; border-radius: 5px;
       background: rgba(24, 24, 27, .96);
       border: 1px solid rgba(255, 255, 255, .12);
@@ -1251,10 +1451,36 @@
       font: 12px/1.4 Inter, Roobert, Helvetica, sans-serif;
       color: #efeff1; pointer-events: none; white-space: nowrap;
     }
-    .ute-bubble.ute-on { display: flex; }
-    .ute-bubble img { height: 28px; width: auto; max-width: 64px; object-fit: contain; }
-    .ute-bubble-code { font-weight: 600; }
-    .ute-bubble-src { color: #adadb8; }
+    .ute-card.ute-on { display: flex; }
+    .ute-card img { height: 28px; width: auto; max-width: 64px; object-fit: contain; }
+    .ute-card-code { font-weight: 600; }
+    .ute-card-src { color: #adadb8; }
+    /* above the chat box */
+    .ute-bubble { position: absolute; bottom: calc(100% + 6px); inset-inline-start: 10px; z-index: 20; }
+    /* beside whatever emote is hovered */
+    .ute-tip { position: fixed; z-index: 2147483000; }
+    .ute-panel {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
+      margin: 4px 0 2px; padding: 6px 10px;
+      border-block: 1px solid rgba(255, 255, 255, .08);
+      font: 11px/1.5 Inter, Roobert, Helvetica, sans-serif; color: #adadb8;
+    }
+    .ute-panel-counts { color: #efeff1; }
+    .ute-panel-channel { margin-inline-end: auto; }
+    .ute-panel button {
+      all: unset; padding: 2px 8px; border-radius: 3px; cursor: pointer;
+      border: 1px solid rgba(255, 255, 255, .14); color: #dedee3; font: inherit;
+    }
+    .ute-panel button:hover { background: rgba(255, 255, 255, .08); }
+    .ute-panel button:focus-visible { outline: 2px solid #bf94ff; outline-offset: 1px; }
+    .ute-nav-item { position: relative; }
+    .ute-nav-tag {
+      position: absolute; inset-inline: 1px; bottom: 1px;
+      text-align: center; border-radius: 2px;
+      background: rgba(0, 0, 0, .82); color: #fff;
+      font: 700 7px/10px Inter, Roobert, Helvetica, sans-serif;
+      letter-spacing: .03em; pointer-events: none;
+    }
   `);
 
   const Composer = {
@@ -1303,9 +1529,10 @@
         const anchor = editable.closest('.chat-input') || box;
         if (getComputedStyle(anchor).position === 'static') anchor.style.position = 'relative';
         const bubble = document.createElement('div');
-        bubble.className = 'ute-bubble';
+        bubble.className = 'ute-card ute-bubble';
         bubble.setAttribute('aria-hidden', 'true');
-        bubble.innerHTML = '<img alt=""><span class="ute-bubble-code"></span><span class="ute-bubble-src"></span>';
+        bubble.innerHTML = '<img alt=""><span class="ute-card-code"></span>' +
+                           '<span class="ute-card-src"></span>';
         anchor.appendChild(bubble);
         this.bubble = bubble;
       }
@@ -1372,8 +1599,8 @@
       if (!info) { bubble.classList.remove('ute-on'); return; }
       bubble.querySelector('img').src = info.url;
       bubble.querySelector('img').alt = info.code;
-      bubble.querySelector('.ute-bubble-code').textContent = info.code;
-      bubble.querySelector('.ute-bubble-src').textContent = info.label;
+      bubble.querySelector('.ute-card-code').textContent = info.code;
+      bubble.querySelector('.ute-card-src').textContent = info.label;
       bubble.classList.add('ute-on');
     },
 
@@ -1477,8 +1704,10 @@
   const Hud = {
     el: null,
 
-    mount() {
-      if (!CONFIG.showHud || this.el || !document.body) return;
+    mount(pickerHostsControls) {
+      const wanted = CONFIG.showHud === true
+        || (CONFIG.showHud === 'auto' && !pickerHostsControls);
+      if (!wanted || this.el || !document.body) return;
       addStyle(`
         #ute-hud {
           position: fixed; right: 8px; bottom: 8px; z-index: 2147483000;
@@ -1567,7 +1796,8 @@
     if (booted) return;
     booted = true;
 
-    Hud.mount();
+    const pickerHostsControls = profile === 'twitch' && CONFIG.pickerSections && CONFIG.pickerPanel;
+    Hud.mount(pickerHostsControls);
     Renderer.attach(root, messages);
     if (profile === 'twitch') { Picker.start(); Composer.start(); }
 

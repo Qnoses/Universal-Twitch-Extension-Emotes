@@ -25,6 +25,12 @@ swaps matching words in incoming messages for images:
 - **FrankerFaceZ** — global sets and the channel's room sets, preferring the
   animated variant where one exists.
 
+This covers every place Twitch renders chat text, not only the message list —
+pinned messages, hype chat and other community highlights sit in a separate
+stack above it, and are matched by the same
+`data-a-target="chat-message-text"` hook every Twitch message form uses.
+Hovering a rendered emote shows a small card with its name and provider.
+
 Channel emotes win over global emotes when a code collides, matching what the
 real extensions do. **Zero-width emotes stack** rather than sitting side by
 side: 7TV's `ZeroWidth` flag, FFZ's `modifier` emotes and BetterTTV's overlay
@@ -43,7 +49,7 @@ emotes, cosmetics, settings panes, chat tooling. Plenty of people install one
 for a single part of that — seeing the emotes everyone else is using — and take
 the rest as freight.
 
-This is that one part, in a single file of about 1,600 commented lines you can
+This is that one part, in a single file of about 1,900 commented lines you can
 read end to end before deciding to trust it. There's no bundle to unpack, no
 build step, no background service worker sitting in your browser between
 sessions, and no permissions beyond whatever your userscript manager already
@@ -112,7 +118,8 @@ Channel emotes need a channel name, and then a numeric Twitch user ID. The
 script tries, in order:
 
 1. A `channelOverrides` entry for the host, then any channel you've set by hand
-   from the corner readout.
+   from the picker's status row (or the corner readout, where there's no
+   picker).
 2. The URL — `/popout/<ch>/chat`, `/embed/<ch>/chat`, `/moderator/<ch>`, a bare
    `/<ch>` that isn't a reserved Twitch path, or the `?channel=` parameter that
    nearly every embed and overlay widget takes.
@@ -126,17 +133,30 @@ doesn't have to: FrankerFaceZ's room endpoint returns the channel's `twitch_id`
 answers the ID question. `api.ivr.fi` and `decapi.me` are fallbacks if FFZ has
 no room entry.
 
-If nothing resolves, the script still loads the three global sets and says so in
-the corner readout — click it and type the channel name, which is remembered
-for that page.
+If nothing resolves, the script still loads the three global sets and says so —
+the picker's status row reads *channel not detected*, and its **Set channel**
+button takes the name by hand, remembered for that page. Where there's no emote
+picker, the corner readout carries the same control.
 
 ## Sections in the emote picker
 
 On `twitch.tv`, the channel's 7TV, BetterTTV and FrankerFaceZ emotes are added
-to Twitch's emote menu as three further sections, placed directly after the
-channel's own native emotes. Clicking one inserts its code into the chat box,
-the picker's search box filters them alongside Twitch's, and each provider gets
-a tab on the right-hand nav rail that jumps to its section.
+to Twitch's emote menu as three further sections, placed directly below the
+channel's own native emotes so Twitch's keep top billing. Clicking one inserts
+its code into the chat box, the picker's search box filters them alongside
+Twitch's, and each provider gets a tab on the right-hand nav rail that jumps to
+its section.
+
+Each tab reuses the channel's own icon with the provider tagged in the corner,
+so they read as siblings of Twitch's tabs rather than foreign objects, and they
+sit directly below the channel's tab to match the section order. The rail is a
+separate React subtree from the sections list and re-renders on its own, so the
+tabs are re-asserted on every pass rather than only when the sections are built.
+
+A slim status row above the sections shows how many emotes each provider
+contributed and which channel they came from, with buttons to set the channel by
+hand or force a reload. That lives here rather than floating over the chat UI,
+where it had nowhere to sit without covering Twitch's own controls.
 
 **Nothing hardcodes a class name.** Twitch's picker is styled-components
 output, so every visual class is a build hash — `bVKCgo`, `eXryG`, `AoXTY` —
@@ -241,6 +261,9 @@ changes.
   emote height.
 - `providers` (default all `true`) — `sevenTV`, `bttv`, `ffz`. Switching one off
   skips its network calls entirely.
+- `hoverCard` (default `true`) — show a small card with the emote's name and
+  provider when you hover a rendered emote. `false` falls back to a plain
+  browser tooltip.
 - `priority` — the order codes overwrite each other. Later entries win, so the
   default puts channel sets above globals.
 - `cacheTTL` (default 30 minutes) — how long emote lists are reused before a
@@ -268,6 +291,7 @@ changes.
   hundreds of emotes and bury the channel's own.
 - `pickerNavIcons` (default `true`) — add a per-provider tab to the picker's
   right-hand nav rail.
+- `pickerPanel` (default `true`) — the status row above those sections.
 - `composerPreview` (default `true`) — draw emotes over their codes in the chat
   box while typing.
 - `composerBubble` (default `true`) — show the preview card above the input for
@@ -275,9 +299,10 @@ changes.
 
 **Diagnostics**
 
-- `showHud` (default `true`) — the small readout in the corner of the chat
-  frame. Click it for per-provider counts, to set the channel by hand, or to
-  force a reload of the emote lists.
+- `showHud` (default `'auto'`) — the corner readout carrying the same counts and
+  controls as the picker's status row. `'auto'` shows it only where there's no
+  status row to host them — non-Twitch chat, or with `pickerSections` or
+  `pickerPanel` off. `true` and `false` force it either way.
 - `debug` (default `false`) — logs detection, channel resolution and emote
   counts to the console, which is the fastest way to see which of the two
   failed.
@@ -298,9 +323,10 @@ changes.
 - In the chat box, paints into a separate overlay only. Nothing inside the
   input's editable region is ever added, removed or rewritten, so sent messages
   are unaffected by this script.
-- In the picker, inserts cloned sections after the channel's native emotes and
-  leaves Twitch's own nodes alone; sections are re-added if a re-render drops
-  them, and cleared first so they can't accumulate.
+- In the picker, inserts cloned sections below the channel's native emotes and
+  leaves Twitch's own nodes alone. Sections are re-added if a re-render drops
+  them, cleared first so they can't accumulate, and repositioned if Twitch
+  mounts a section late.
 - Emote codes are matched as whole space-delimited tokens, so a code appearing
   inside a longer word is left alone.
 - Toggle it off in your manager to fully revert.
@@ -310,9 +336,10 @@ changes.
 Being the light option is a claim worth backing, so concretely: on a page with
 no chat the script patches two history methods, attaches two observers, finds
 nothing, disconnects them both within three minutes, and does nothing else for
-the lifetime of the tab. On a chat page it holds one observer per chat root and
-one cached emote list — and with a warm cache it makes no network requests at
-all.
+the lifetime of the tab. On a chat page it holds one observer on the chat root
+and one cached emote list, plus — on `twitch.tv` only — three more watching the
+emote picker and the chat input. With a warm cache it makes no network requests
+at all.
 
 Matching every site is only affordable if the cost on a site without chat is
 near zero, so detection is bounded three ways: the structural detector gives up
@@ -351,8 +378,8 @@ that scale with emote count are bounded too:
   emote occupies the width of its code rather than reflowing the line. A code
   that wraps across two lines stays as text.
 - The 7TV EventAPI isn't wired up, so an emote added to a channel mid-stream
-  appears after the cache refreshes rather than instantly. The corner readout's
-  reload button forces it.
+  appears after the cache refreshes rather than instantly. The **Reload emotes**
+  button forces it.
 - BetterTTV publishes no zero-width flag, so its overlay emotes are recognised
   from a static list of codes; a new one added by BetterTTV renders inline until
   the list is updated.
