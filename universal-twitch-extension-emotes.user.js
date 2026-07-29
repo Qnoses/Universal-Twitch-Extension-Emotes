@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      2.7
+// @version      2.8
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -1102,7 +1102,6 @@
     sections: [],
     panel: null,
     query: '',
-    activeProvider: null,   // survives the picker being closed and reopened
     queued: false,
 
     start() {
@@ -1129,8 +1128,6 @@
     reset() {
       this.sections = [];
       this.panel = null;
-      this.suppressed = [];
-      this.activeProvider = null;
       if (this.hostObserver) { this.hostObserver.disconnect(); this.hostObserver = null; }
     },
 
@@ -1224,7 +1221,6 @@
 
       this.wireSearch(picker);
       this.wireHoverCards(picker);
-      this.wireScrollSpy(picker);
       this.injectNav(picker, groups);
       log('picker: added', this.sections.length, 'sections');
     },
@@ -1431,123 +1427,6 @@
       }
     },
 
-    /**
-     * Twitch marks the current tab with aria-current plus a pair of classes
-     * whose names are build-specific. Read them off the live active tab rather
-     * than hardcoding, so the highlight keeps working across restyles.
-     */
-    activeTokens(toolbar) {
-      const tokens = { wrapper: [], inner: [] };
-      const current = toolbar.querySelector('[aria-current="true"]');
-      if (!current) return tokens;
-      let wrapper = current;
-      while (wrapper && wrapper.parentElement !== toolbar) wrapper = wrapper.parentElement;
-      if (wrapper) {
-        tokens.wrapper = Array.from(wrapper.classList).filter(c => /active/i.test(c));
-      }
-      for (const el of current.querySelectorAll('*')) {
-        for (const c of el.classList) {
-          if (/active/i.test(c) && !tokens.inner.includes(c)) tokens.inner.push(c);
-        }
-      }
-      return tokens;
-    },
-
-    /**
-     * Take Twitch's highlight away, remembering exactly what was taken.
-     *
-     * Stripping the classes outright was not reversible: React's state still
-     * says that tab is current, so clicking it changes nothing and never
-     * triggers the re-render that would put the class back. Navigating from
-     * one of our sections back to the channel's therefore left nothing lit,
-     * and the states compounded from there.
-     */
-    suppressNative(toolbar) {
-      this.restoreNative();
-      const tokens = this.tokens || { wrapper: [], inner: [] };
-      this.suppressed = [];
-      for (const button of toolbar.querySelectorAll('[aria-current="true"]')) {
-        if (button.closest('[data-ute-nav]')) continue;
-        let wrapper = button;
-        while (wrapper && wrapper.parentElement !== toolbar) wrapper = wrapper.parentElement;
-        const record = { button, wrapper, wrapperTokens: [], innerTokens: [] };
-        if (wrapper) {
-          for (const c of tokens.wrapper) {
-            if (wrapper.classList.contains(c)) { wrapper.classList.remove(c); record.wrapperTokens.push(c); }
-          }
-        }
-        for (const el of button.querySelectorAll('*')) {
-          for (const c of tokens.inner) {
-            if (el.classList.contains(c)) { el.classList.remove(c); record.innerTokens.push([el, c]); }
-          }
-        }
-        button.setAttribute('aria-current', 'false');
-        this.suppressed.push(record);
-      }
-    },
-
-    /** Put back precisely what suppressNative took, unless React moved on. */
-    restoreNative(toolbar) {
-      const moved = toolbar && Array.from(toolbar.querySelectorAll('[aria-current="true"]'))
-        .some(b => !b.closest('[data-ute-nav]'));
-      for (const r of this.suppressed || []) {
-        if (moved) continue;               // Twitch has since lit another tab
-        if (r.wrapper && r.wrapper.isConnected) r.wrapperTokens.forEach(c => r.wrapper.classList.add(c));
-        for (const [el, c] of r.innerTokens) if (el.isConnected) el.classList.add(c);
-        if (r.button && r.button.isConnected) r.button.setAttribute('aria-current', 'true');
-      }
-      this.suppressed = [];
-    },
-
-    /** Highlight one of our tabs, and only one — or none. */
-    setActiveTab(toolbar, provider) {
-      if (this.activeProvider === provider) return;
-      this.activeProvider = provider;
-      const tokens = this.tokens || { wrapper: [], inner: [] };
-      for (const item of toolbar.querySelectorAll('[data-ute-nav]')) {
-        const on = item.dataset.uteNav === provider;
-        const button = item.querySelector('button');
-        const inner = button && button.firstElementChild;
-        tokens.wrapper.forEach(c => item.classList.toggle(c, on));
-        if (inner) tokens.inner.forEach(c => inner.classList.toggle(c, on));
-        if (button) button.setAttribute('aria-current', on ? 'true' : 'false');
-      }
-      if (provider) this.suppressNative(toolbar);
-      else this.restoreNative(toolbar);
-    },
-
-    /**
-     * Whichever section is at the top of the scroller owns the highlight,
-     * which is how Twitch's own rail behaves. Driving the state from scroll
-     * position rather than from clicks keeps the two in step no matter how
-     * the user got there.
-     */
-    wireScrollSpy(picker) {
-      if (picker.dataset.uteSpy === '1') return;
-      const scroller = picker.querySelector(
-        '.emote-picker__scroll-container, .emote-picker__tab-content');
-      const toolbar = picker.querySelector(PSEL.nav);
-      if (!scroller || !toolbar) return;
-      picker.dataset.uteSpy = '1';
-      let queued = false;
-      scroller.addEventListener('scroll', () => {
-        if (queued) return;
-        queued = true;
-        requestAnimationFrame(() => { queued = false; this.syncActiveTab(scroller, toolbar); });
-      }, { passive: true });
-    },
-
-    syncActiveTab(scroller, toolbar) {
-      if (!this.sections.length) return;
-      const edge = scroller.getBoundingClientRect().top + 8;
-      let current = null;
-      for (const section of this.sections) {
-        const r = section.getBoundingClientRect();
-        if (r.top <= edge && r.bottom > edge) { current = section.dataset.uteSection; break; }
-      }
-      this.setActiveTab(toolbar, current);
-    },
-
     /** The channel's own tab: the one avatar-style item we can safely clone. */
     navChannelTab(toolbar) {
       const button = toolbar.querySelector('[data-a-target="CHANNEL_EMOTES"]');
@@ -1562,6 +1441,14 @@
      * React subtree from the sections list, and re-renders on its own — which
      * is why these could vanish while the sections they point at survived.
      *
+     * Deliberately absent: any attempt to move the rail's selected-tab
+     * highlight onto these tabs. React owns that state and we can neither read
+     * nor write it, so every version of that synchronisation leaked into an
+     * invalid state after enough clicks. Left alone, Twitch's own scroll spy
+     * keeps the channel tab lit while our sections are in view — they sit
+     * inside its range — which is both correct and free. These tabs scroll to
+     * their section and claim nothing.
+     *
      * It also has to wait for the channel tab. Cloning whatever happened to be
      * there first produced three copies of the clock icon at the bottom of the
      * rail: the "ghost entries".
@@ -1573,17 +1460,6 @@
 
       const source = this.navChannelTab(toolbar);
       if (!source) return;                       // too early; retry next check
-
-      this.tokens = this.activeTokens(toolbar);
-
-      // Clicking a native tab means Twitch owns the highlight again.
-      if (toolbar.dataset.uteNavWired !== '1') {
-        toolbar.dataset.uteNavWired = '1';
-        toolbar.addEventListener('click', e => {
-          const item = e.target && e.target.closest ? e.target.closest('[role="toolbar"] > *') : null;
-          if (item && !item.hasAttribute('data-ute-nav')) this.setActiveTab(toolbar, null);
-        }, true);
-      }
 
       const existing = toolbar.querySelectorAll('[data-ute-nav]');
       const placed = existing.length === groups.length
@@ -1600,7 +1476,8 @@
         item.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
         // The channel tab may well be the active one, and its active classes
         // would otherwise come along with the clone — which is why every tab
-        // looked selected after reopening the picker.
+        // looked selected after reopening the picker. This is the only
+        // highlight-related work left, and it is done on our own clone.
         const strip = el => Array.from(el.classList)
           .filter(c => /active/i.test(c)).forEach(c => el.classList.remove(c));
         strip(item);
@@ -1629,7 +1506,6 @@
           button.addEventListener('click', ev => {
             ev.preventDefault();
             ev.stopPropagation();
-            this.setActiveTab(toolbar, group.provider);
             const target = picker.querySelector(`[data-ute-section="${group.provider}"]`);
             if (target && typeof target.scrollIntoView === 'function') {
               // 'instant' rather than 'smooth', and explicit rather than
@@ -1641,15 +1517,6 @@
         }
         ref.parentNode.insertBefore(item, ref.nextSibling);
         ref = item;
-      }
-      // Restore whatever was selected when the picker was last closed. The
-      // no-op guard in setActiveTab compares against the remembered provider,
-      // so it has to be cleared first or nothing is applied to the new nodes.
-      if (this.activeProvider) {
-        const restore = this.activeProvider;
-        this.activeProvider = null;
-        this.suppressed = [];
-        this.setActiveTab(toolbar, restore);
       }
       log('picker: nav tabs placed below the channel tab');
     },

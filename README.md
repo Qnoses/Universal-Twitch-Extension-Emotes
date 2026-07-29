@@ -50,7 +50,7 @@ emotes, cosmetics, settings panes, chat tooling. Plenty of people install one
 for a single part of that — seeing the emotes everyone else is using — and take
 the rest as freight.
 
-This is that one part, in a single file of about 2,200 commented lines you can
+This is that one part, in a single file of about 2,000 commented lines you can
 read end to end before deciding to trust it. There's no bundle to unpack, no
 build step, no background service worker sitting in your browser between
 sessions, and no permissions beyond whatever your userscript manager already
@@ -157,11 +157,14 @@ the chat box uses, below the emote as Twitch places its own. The picker's
 search box filters these sections alongside Twitch's, and each provider gets a
 tab on the right-hand nav rail.
 
-The rail's highlight follows the scroll position, the way Twitch's own does,
-rather than the last thing clicked — so it stays right however you got there.
-Taking the highlight from a Twitch tab is done reversibly: React's state still
-believes its tab is current, so clicking that tab again triggers no re-render,
-and anything removed outright would never come back.
+The rail's selected-tab highlight is left entirely to Twitch. Our tabs scroll
+to their section and claim nothing, because our sections sit inside the channel
+section's scroll range — so Twitch's own scroll spy keeps the channel tab lit
+while they're in view, which is both correct and free. Moving that highlight
+onto our tabs meant writing to state React owns and we can't read, and every
+version of that synchronisation drifted into an invalid state after enough
+clicks. The tabs sit directly beneath the channel's own and carry a provider
+tag, so the grouping already says what they are.
 
 Each tab reuses the channel's own icon with the provider tagged in the corner,
 so they read as siblings of Twitch's tabs rather than foreign objects, and they
@@ -353,9 +356,9 @@ chat, so anything drawn on detection would turn up on ordinary sites too.
 - Its own overlays, cards and panels are excluded from chat processing, so the
   script never renders into its own output.
 - In the picker, inserts cloned sections below the channel's native emotes and
-  leaves Twitch's own nodes alone. Sections are re-added if a re-render drops
-  them, cleared first so they can't accumulate, and repositioned if Twitch
-  mounts a section late.
+  writes to nothing of Twitch's — not a class, not an attribute. Sections are
+  re-added if a re-render drops them, cleared first so they can't accumulate,
+  and repositioned if Twitch mounts a section late.
 - Emote codes are matched as whole space-delimited tokens, so a code appearing
   inside a longer word is left alone.
 - Toggle it off in your manager to fully revert.
