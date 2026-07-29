@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      2.6
+// @version      2.7
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -1036,8 +1036,37 @@
   }
 
   /**
+   * Hand text to the editor through the one event it can take over.
+   *
+   * dispatchEvent returns false when something called preventDefault, which is
+   * how a modelled editor signals it handled the input itself. If it declines,
+   * writing the text anyway would put characters in the DOM that the editor's
+   * model has never heard of — and that is precisely the broken state: the
+   * placeholder stays up because the model is still empty, the caret sits in
+   * the wrong place, backspace deletes from a model that never had the text so
+   * the code appears to survive deletion, and the next keystroke re-renders
+   * from the model and wipes the lot. So for an editor that declares a model,
+   * a refusal is taken as a refusal.
+   */
+  function commitInsertion(editor, text) {
+    const modelled = editor.hasAttribute('data-slate-editor');
+    const taken = !editor.dispatchEvent(new InputEvent('beforeinput', {
+      inputType: 'insertText', data: text, bubbles: true, cancelable: true,
+    }));
+    if (taken) return true;
+    if (modelled) return false;
+    try { return document.execCommand('insertText', false, text); } catch (e) { return false; }
+  }
+
+  /**
    * Insert an emote code at the end of the message: a space before it unless
    * the box is empty or already ends in whitespace, and always a space after.
+   *
+   * The work is deferred by a frame because the editor syncs its own selection
+   * from the DOM on selectionchange, which lands in a later task. Inserting in
+   * the same tick arrives while that selection is still empty — most visibly
+   * when the box was empty to begin with, since then there is no earlier
+   * selection to fall back on.
    */
   function insertIntoChatInput(code) {
     const editor = document.querySelector(PSEL.input);
@@ -1046,20 +1075,25 @@
     editor.focus({ preventScroll: true });
     caretToEnd(editor);
 
-    const typed = composerText(editor);
-    // A committed emote is not text but is still content, so a code following
-    // it needs its separating space.
-    const hasContent = typed.length > 0 || !!editor.querySelector(PSEL.nativeEmote);
-    const lead = hasContent && !/\s$/.test(typed) ? ' ' : '';
-    const text = lead + code + ' ';
+    const attempt = retry => {
+      if (!editor.isConnected) return;
+      if (document.activeElement !== editor) editor.focus({ preventScroll: true });
+      caretToEnd(editor);
 
-    let ok = false;
-    try { ok = document.execCommand('insertText', false, text); } catch (e) { ok = false; }
-    if (!ok) {
-      editor.dispatchEvent(new InputEvent('beforeinput', {
-        inputType: 'insertText', data: text, bubbles: true, cancelable: true,
-      }));
-    }
+      const typed = composerText(editor);
+      // A committed emote is not text but is still content, so a code
+      // following one needs its separating space.
+      const hasContent = typed.length > 0 || !!editor.querySelector(PSEL.nativeEmote);
+      const lead = hasContent && !/\s$/.test(typed) ? ' ' : '';
+
+      if (commitInsertion(editor, lead + code + ' ')) return;
+      if (retry > 0) { setTimeout(() => attempt(retry - 1), 24); return; }
+      warn('the chat editor declined the insertion of', code);
+    };
+
+    const soon = () => setTimeout(() => attempt(2), 0);
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(soon);
+    else soon();
     return true;
   }
 
@@ -1095,6 +1129,8 @@
     reset() {
       this.sections = [];
       this.panel = null;
+      this.suppressed = [];
+      this.activeProvider = null;
       if (this.hostObserver) { this.hostObserver.disconnect(); this.hostObserver = null; }
     },
 
@@ -1188,6 +1224,7 @@
 
       this.wireSearch(picker);
       this.wireHoverCards(picker);
+      this.wireScrollSpy(picker);
       this.injectNav(picker, groups);
       log('picker: added', this.sections.length, 'sections');
     },
@@ -1338,7 +1375,9 @@
       // Deliberately no data-ute-code here: that attribute counts cells, and
       // duplicating it on the image doubled every cell count and search filter.
       // alt already carries the code for the hover card.
-      img.dataset.uteSrc = group.label;
+      // The section heading beside it already says "Channel Emotes"; the card
+      // only needs the provider, and the full label overran the line.
+      img.dataset.uteSrc = PROVIDER_LABEL[emote.provider] || group.label;
       if (emote.srcset) img.srcset = emote.srcset; else img.removeAttribute('srcset');
 
       // Without this the composer is blurred on mousedown, before the click
@@ -1414,32 +1453,99 @@
       return tokens;
     },
 
-    /** Highlight one of our tabs, and only one. */
+    /**
+     * Take Twitch's highlight away, remembering exactly what was taken.
+     *
+     * Stripping the classes outright was not reversible: React's state still
+     * says that tab is current, so clicking it changes nothing and never
+     * triggers the re-render that would put the class back. Navigating from
+     * one of our sections back to the channel's therefore left nothing lit,
+     * and the states compounded from there.
+     */
+    suppressNative(toolbar) {
+      this.restoreNative();
+      const tokens = this.tokens || { wrapper: [], inner: [] };
+      this.suppressed = [];
+      for (const button of toolbar.querySelectorAll('[aria-current="true"]')) {
+        if (button.closest('[data-ute-nav]')) continue;
+        let wrapper = button;
+        while (wrapper && wrapper.parentElement !== toolbar) wrapper = wrapper.parentElement;
+        const record = { button, wrapper, wrapperTokens: [], innerTokens: [] };
+        if (wrapper) {
+          for (const c of tokens.wrapper) {
+            if (wrapper.classList.contains(c)) { wrapper.classList.remove(c); record.wrapperTokens.push(c); }
+          }
+        }
+        for (const el of button.querySelectorAll('*')) {
+          for (const c of tokens.inner) {
+            if (el.classList.contains(c)) { el.classList.remove(c); record.innerTokens.push([el, c]); }
+          }
+        }
+        button.setAttribute('aria-current', 'false');
+        this.suppressed.push(record);
+      }
+    },
+
+    /** Put back precisely what suppressNative took, unless React moved on. */
+    restoreNative(toolbar) {
+      const moved = toolbar && Array.from(toolbar.querySelectorAll('[aria-current="true"]'))
+        .some(b => !b.closest('[data-ute-nav]'));
+      for (const r of this.suppressed || []) {
+        if (moved) continue;               // Twitch has since lit another tab
+        if (r.wrapper && r.wrapper.isConnected) r.wrapperTokens.forEach(c => r.wrapper.classList.add(c));
+        for (const [el, c] of r.innerTokens) if (el.isConnected) el.classList.add(c);
+        if (r.button && r.button.isConnected) r.button.setAttribute('aria-current', 'true');
+      }
+      this.suppressed = [];
+    },
+
+    /** Highlight one of our tabs, and only one — or none. */
     setActiveTab(toolbar, provider) {
+      if (this.activeProvider === provider) return;
       this.activeProvider = provider;
       const tokens = this.tokens || { wrapper: [], inner: [] };
       for (const item of toolbar.querySelectorAll('[data-ute-nav]')) {
         const on = item.dataset.uteNav === provider;
         const button = item.querySelector('button');
         const inner = button && button.firstElementChild;
-        if (tokens.wrapper.length) item.classList.toggle(tokens.wrapper[0], on);
-        for (const c of tokens.wrapper.slice(1)) item.classList.toggle(c, on);
-        if (inner) for (const c of tokens.inner) inner.classList.toggle(c, on);
+        tokens.wrapper.forEach(c => item.classList.toggle(c, on));
+        if (inner) tokens.inner.forEach(c => inner.classList.toggle(c, on));
         if (button) button.setAttribute('aria-current', on ? 'true' : 'false');
       }
-      // Twitch's scroll spy will otherwise leave the channel tab lit as well,
-      // because our sections sit inside its scroll range. Best effort: it may
-      // re-apply on its next render.
-      if (provider) {
-        for (const native of toolbar.querySelectorAll('[aria-current="true"]')) {
-          if (native.closest('[data-ute-nav]')) continue;
-          native.setAttribute('aria-current', 'false');
-          let wrapper = native;
-          while (wrapper && wrapper.parentElement !== toolbar) wrapper = wrapper.parentElement;
-          if (wrapper) tokens.wrapper.forEach(c => wrapper.classList.remove(c));
-          native.querySelectorAll('*').forEach(el => tokens.inner.forEach(c => el.classList.remove(c)));
-        }
+      if (provider) this.suppressNative(toolbar);
+      else this.restoreNative(toolbar);
+    },
+
+    /**
+     * Whichever section is at the top of the scroller owns the highlight,
+     * which is how Twitch's own rail behaves. Driving the state from scroll
+     * position rather than from clicks keeps the two in step no matter how
+     * the user got there.
+     */
+    wireScrollSpy(picker) {
+      if (picker.dataset.uteSpy === '1') return;
+      const scroller = picker.querySelector(
+        '.emote-picker__scroll-container, .emote-picker__tab-content');
+      const toolbar = picker.querySelector(PSEL.nav);
+      if (!scroller || !toolbar) return;
+      picker.dataset.uteSpy = '1';
+      let queued = false;
+      scroller.addEventListener('scroll', () => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => { queued = false; this.syncActiveTab(scroller, toolbar); });
+      }, { passive: true });
+    },
+
+    syncActiveTab(scroller, toolbar) {
+      if (!this.sections.length) return;
+      const edge = scroller.getBoundingClientRect().top + 8;
+      let current = null;
+      for (const section of this.sections) {
+        const r = section.getBoundingClientRect();
+        if (r.top <= edge && r.bottom > edge) { current = section.dataset.uteSection; break; }
       }
+      this.setActiveTab(toolbar, current);
     },
 
     /** The channel's own tab: the one avatar-style item we can safely clone. */
@@ -1536,8 +1642,15 @@
         ref.parentNode.insertBefore(item, ref.nextSibling);
         ref = item;
       }
-      // Restore whatever was selected when the picker was last closed.
-      if (this.activeProvider) this.setActiveTab(toolbar, this.activeProvider);
+      // Restore whatever was selected when the picker was last closed. The
+      // no-op guard in setActiveTab compares against the remembered provider,
+      // so it has to be cleared first or nothing is applied to the new nodes.
+      if (this.activeProvider) {
+        const restore = this.activeProvider;
+        this.activeProvider = null;
+        this.suppressed = [];
+        this.setActiveTab(toolbar, restore);
+      }
       log('picker: nav tabs placed below the channel tab');
     },
   };

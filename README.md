@@ -50,7 +50,7 @@ emotes, cosmetics, settings panes, chat tooling. Plenty of people install one
 for a single part of that — seeing the emotes everyone else is using — and take
 the rest as freight.
 
-This is that one part, in a single file of about 1,900 commented lines you can
+This is that one part, in a single file of about 2,200 commented lines you can
 read end to end before deciding to trust it. There's no bundle to unpack, no
 build step, no background service worker sitting in your browser between
 sessions, and no permissions beyond whatever your userscript manager already
@@ -155,8 +155,13 @@ its code to the end of the message, with a space before it unless the box is
 empty or already ends in one, and a space after. Hovering shows the same card
 the chat box uses, below the emote as Twitch places its own. The picker's
 search box filters these sections alongside Twitch's, and each provider gets a
-tab on the right-hand nav rail that jumps to its section and takes the
-selected-tab highlight while it's there.
+tab on the right-hand nav rail.
+
+The rail's highlight follows the scroll position, the way Twitch's own does,
+rather than the last thing clicked — so it stays right however you got there.
+Taking the highlight from a Twitch tab is done reversibly: React's state still
+believes its tab is current, so clicking that tab again triggers no re-render,
+and anything removed outright would never come back.
 
 Each tab reuses the channel's own icon with the provider tagged in the corner,
 so they read as siblings of Twitch's tabs rather than foreign objects, and they
@@ -202,6 +207,13 @@ The script never edits the contents of the input. It measures where each code
 sits and paints the emote on top, in a separate layer the editor can't see, so
 your message text is untouched from the first keystroke to the moment you press
 enter.
+
+Inserting from the picker is the one place text is added, and it goes through
+the same `beforeinput` event a keystroke would, letting the editor apply it to
+its own model. If the editor declines, nothing is written: characters placed in
+the box behind its back look right but aren't really there — the placeholder
+stays up, backspace deletes from a model that never had them, and the next
+keystroke wipes the lot.
 
 That's a deliberate constraint rather than a shortcut. Twitch's input keeps its
 own internal document model, and the tidier-looking approaches — dropping an
@@ -273,7 +285,7 @@ changes.
   emote height.
 - `providers` (default all `true`) — `sevenTV`, `bttv`, `ffz`. Switching one off
   skips its network calls entirely.
-- `hoverCard` (default `true`) — show a small card with the emote's name and
+- `hoverCard` (default `true`) — show a small card naming the emote and its
   provider when you hover one, in chat and in the emote picker. `false` falls
   back to a plain browser tooltip.
 - `priority` — the order codes overwrite each other. Later entries win, so the
