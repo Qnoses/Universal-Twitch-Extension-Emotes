@@ -102,11 +102,18 @@ name to select, because everything is minified and different on every site.
 Matching `[class*="chat"]` is the obvious approach and a bad one — it fires on
 static markup, help pages and marketing copy across half the web.
 
-Instead the script watches for the **behaviour** of a chat log. A container that
-repeatedly receives new element children carrying short text is a live message
-feed; a container with "chat" in its class name that never changes is not.
-Three such appends into the same parent, with a few siblings already present,
-promotes that parent to a chat root and the detector shuts down.
+Instead the script watches for the **shape** of a chat log. A chat line, on
+Twitch and on every IRC-style renderer, looks like `name: message` — a short
+name, a colon, then text. A list of articles, comments or notifications grows
+over time in exactly the same way but never takes that shape, which is what
+separates the two.
+
+Two such lines appended into the same parent promotes it to a chat root and the
+detector shuts down. A far higher plain-text threshold acts as a fallback, for
+renderers that draw the separator in CSS so it never reaches the text — losing
+real chat is a worse failure than a harmless false match. The class-name fast
+path also now requires a chat-shaped child, so a container merely *named* like
+chat isn't enough.
 
 Known layouts — Twitch, KapChat, StreamElements, Streamlabs — skip this
 entirely and use a selector profile, so the heuristic only ever runs on
@@ -118,8 +125,7 @@ Channel emotes need a channel name, and then a numeric Twitch user ID. The
 script tries, in order:
 
 1. A `channelOverrides` entry for the host, then any channel you've set by hand
-   from the picker's status row (or the corner readout, where there's no
-   picker).
+   from the picker's status row or your userscript manager's menu.
 2. The URL — `/popout/<ch>/chat`, `/embed/<ch>/chat`, `/moderator/<ch>`, a bare
    `/<ch>` that isn't a reserved Twitch path, or the `?channel=` parameter that
    nearly every embed and overlay widget takes.
@@ -133,10 +139,11 @@ doesn't have to: FrankerFaceZ's room endpoint returns the channel's `twitch_id`
 answers the ID question. `api.ivr.fi` and `decapi.me` are fallbacks if FFZ has
 no room entry.
 
-If nothing resolves, the script still loads the three global sets and says so —
+If nothing resolves, the script still loads the three global sets and says so:
 the picker's status row reads *channel not detected*, and its **Set channel**
-button takes the name by hand, remembered for that page. Where there's no emote
-picker, the corner readout carries the same control.
+button takes the name by hand, remembered for that page. Off Twitch, where
+there is no picker, the same control sits in your userscript manager's menu —
+which also shows the current channel and emote count in its labels.
 
 ## Sections in the emote picker
 
@@ -216,8 +223,9 @@ Four cases are left as plain text deliberately, so they aren't bugs:
 - **Anything typed with an IME.** The overlay steps aside during composition and
   returns when you're done.
 - **A channel's Twitch subscriber emotes, if you're not subscribed.** Those send
-  as the literal word, so they're shown as the literal word rather than
-  promising an emote nobody will receive.
+  as the literal word, so they're shown as one rather than promising an emote
+  nobody will receive — unless a third-party emote happens to share the name,
+  which is then what viewers actually see, so that is what's drawn.
 
 ## Two constraints it works around
 
@@ -299,18 +307,21 @@ changes.
 
 **Diagnostics**
 
-- `showHud` (default `'auto'`) — the corner readout carrying the same counts and
-  controls as the picker's status row. `'auto'` shows it only where there's no
-  status row to host them — non-Twitch chat, or with `pickerSections` or
-  `pickerPanel` off. `true` and `false` force it either way.
 - `debug` (default `false`) — logs detection, channel resolution and emote
   counts to the console, which is the fastest way to see which of the two
   failed.
 
+The two controls that have to work everywhere — **Set channel** and **Reload
+emotes** — are registered in your userscript manager's menu, with the current
+channel and emote count in their labels. There is no floating panel on the
+page: the structural detector is deliberately generous about what counts as
+chat, so anything drawn on detection would turn up on ordinary sites too.
+
 ## Scope & behavior
 
 - Runs on all sites at `document-idle`, in frames as well as top-level
-  documents.
+  documents. Draws no UI of its own outside chat: its controls live in the
+  userscript manager's menu, and on `twitch.tv` in the emote picker.
 - Does nothing until a chat log is identified; on a page without one it disarms
   its observers and goes quiet.
 - Network access is read-only, to the three emote APIs and at most two ID
@@ -323,6 +334,8 @@ changes.
 - In the chat box, paints into a separate overlay only. Nothing inside the
   input's editable region is ever added, removed or rewritten, so sent messages
   are unaffected by this script.
+- Its own overlays, cards and panels are excluded from chat processing, so the
+  script never renders into its own output.
 - In the picker, inserts cloned sections below the channel's native emotes and
   leaves Twitch's own nodes alone. Sections are re-added if a re-render drops
   them, cleared first so they can't accumulate, and repositioned if Twitch
@@ -378,14 +391,15 @@ that scale with emote count are bounded too:
   emote occupies the width of its code rather than reflowing the line. A code
   that wraps across two lines stays as text.
 - The 7TV EventAPI isn't wired up, so an emote added to a channel mid-stream
-  appears after the cache refreshes rather than instantly. The **Reload emotes**
-  button forces it.
+  appears after the cache refreshes rather than instantly. **Reload emotes**,
+  in the picker or the manager menu, forces it.
 - BetterTTV publishes no zero-width flag, so its overlay emotes are recognised
   from a static list of codes; a new one added by BetterTTV renders inline until
   the list is updated.
-- The structural detector is a heuristic. On an exotic page it can attach to a
-  live region that isn't chat — harmless, since nothing matches an emote code,
-  but `blocklist` or `genericDetection: false` will stop it.
+- The structural detector is still a heuristic. A page that repeatedly appends
+  `something: something` lines could be mistaken for chat — harmless, since
+  nothing matches an emote code, but `blocklist` or `genericDetection: false`
+  will stop it.
 - SPA navigation is caught by patching `pushState`/`replaceState`; a site that
   navigates some other way may need a reload to pick up the new channel.
 

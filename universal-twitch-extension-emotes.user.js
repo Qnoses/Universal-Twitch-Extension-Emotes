@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      2.3
+// @version      2.5
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -12,6 +12,8 @@
 // @grant        GM_addStyle
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @connect      api.betterttv.net
 // @connect      api.frankerfacez.com
 // @connect      7tv.io
@@ -84,9 +86,6 @@
     // Hovering an emote shows a small card with its name and provider,
     // matching the chat box preview. false falls back to a plain tooltip.
     hoverCard: true,
-    // Status readout and controls. 'auto' shows the corner pill only where the
-    // emote picker isn't available to host them; true/false force it.
-    showHud: 'auto',
     // Add provider sections to Twitch's native emote picker (twitch.tv only).
     pickerSections: true,
     // Also list the three global sets in the picker, not just channel sets.
@@ -434,7 +433,7 @@
         this.ingest(cached.emotes);
         this.channel = login;
         log('cache hit', login, this.map.size);
-        Hud.update();
+        Menu.register();
         // Only reach out again once the cache is genuinely ageing. Refreshing
         // on every page view meant six API calls per Twitch tab for emotes we
         // already had.
@@ -492,7 +491,7 @@
       this.ingest(emotes);
       this.channel = login;
       log('loaded', this.map.size, 'emotes for', login, this.counts);
-      Hud.update();
+      Menu.register();
       Renderer.reprocessAll();
       Picker.refresh();
       Composer.schedule();
@@ -584,6 +583,15 @@
 
     hide() { if (this.el) this.el.classList.remove('ute-on'); },
   };
+
+  /**
+   * Nothing under these is chat, and some of it is ours. The chat root is the
+   * whole chat room, so the composer's own preview card lives inside it: when
+   * that card wrote the emote's name into itself, the observer saw a new text
+   * node and painted a second copy of the emote over it.
+   */
+  const NOT_CHAT = 'input, textarea, [contenteditable="true"], ' +
+                   '.ute-wrap, .ute-card, .ute-panel, .chat-input';
 
   const blobCache = new Map();
 
@@ -682,7 +690,7 @@
       // Never touch inputs, links, or the emote nodes we already made. The
       // whole of .chat-input is off limits: the composer owns its own overlay
       // and the emote picker is not chat.
-      if (el.closest('input, textarea, [contenteditable="true"], .ute-wrap, .chat-input')) return;
+      if (el.closest(NOT_CHAT)) return;
 
       const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
         acceptNode(n) {
@@ -716,7 +724,7 @@
       const handle = nodes => {
         for (const node of nodes) {
           if (node.nodeType === Node.TEXT_NODE) {
-            if (node.parentElement && !node.parentElement.closest('.ute-wrap')) {
+            if (node.parentElement && !node.parentElement.closest(NOT_CHAT)) {
               this.replaceTextNode(node);
             }
             continue;
@@ -829,6 +837,18 @@
    * children carrying text. That is the behavioural signature of a chat log,
    * and it distinguishes chat from static markup with "chat" in a class name.
    */
+  /**
+   * A chat line, on Twitch and on every IRC-style renderer, has one shape a
+   * list of articles or notifications does not: a name, a colon, then the
+   * message. Requiring it is what separates a chat log from any other
+   * container that grows over time — which the old "three text-bearing
+   * appends" rule could not do, and which is why a status panel gated on
+   * detection used to appear on ordinary sites.
+   *
+   * A timestamp prefix ("04:31 PM bob: hi") still matches, harmlessly.
+   */
+  const CHAT_LINE_SHAPE = /^\s*\S[^:\n]{0,60}:\s*\S/;
+
   const GenericDetector = {
     scores: new Map(),
     observer: null,
@@ -836,13 +856,23 @@
 
     start(onFound) {
       if (!CONFIG.genericDetection) return;
+      // scan() runs on every mutation until a chat root is found, so without
+      // this guard each call attached another observer over the same document
+      // while the previous one kept running: every append was then counted
+      // once per accumulated observer, and the promotion thresholds fired
+      // early and unpredictably.
+      if (this.observer) return;
       this.deadline = Date.now() + 120000; // give SPAs two minutes to boot
 
       // Fast path: obvious markup, checked once up front.
       const quick = document.querySelector(
         '[class*="chat-messages"], [class*="chat-list"], [class*="chatMessages"], [id*="chat-log"], [class*="chat-log"]'
       );
-      if (quick && quick.children.length >= 2) { onFound(quick, null); return; }
+      if (quick && quick.children.length >= 2 &&
+          Array.from(quick.children).some(c => CHAT_LINE_SHAPE.test((c.textContent || '').trim()))) {
+        onFound(quick, null);
+        return;
+      }
 
       this.observer = new MutationObserver(muts => {
         if (Date.now() > this.deadline) { this.stop(); return; }
@@ -850,20 +880,30 @@
           const parent = m.target;
           if (!(parent instanceof Element)) continue;
           if (parent.closest('[data-ute-root="1"]')) continue;
-          let interesting = 0;
+          let shaped = 0, plain = 0;
           for (const nd of m.addedNodes) {
             if (nd.nodeType !== Node.ELEMENT_NODE) continue;
             const t = (nd.textContent || '').trim();
-            if (t.length > 0 && t.length < 600) interesting++;
+            if (!t.length || t.length >= 600) continue;
+            plain++;
+            if (CHAT_LINE_SHAPE.test(t)) shaped++;
           }
-          if (!interesting) continue;
+          if (!plain) continue;
 
-          const score = (this.scores.get(parent) || 0) + interesting;
+          const score = this.scores.get(parent) || { shaped: 0, plain: 0 };
+          score.shaped += shaped;
+          score.plain += plain;
           this.scores.set(parent, score);
 
-          // Three appended text-bearing children and at least a few siblings
-          // already present: treat it as a live message log.
-          if (score >= 3 && parent.children.length >= 3) {
+          // Two lines in "name: message" shape is a confident read. The plain
+          // fallback is deliberately far higher, and exists only for renderers
+          // that draw the separator in CSS so it never reaches textContent —
+          // losing real chat is a worse failure than a harmless false match.
+          const confident = score.shaped >= 2 && parent.children.length >= 3;
+          const fallback = score.plain >= 8 && parent.children.length >= 8;
+          if (confident || fallback) {
+            log('generic detection:', confident ? 'chat-shaped' : 'volume fallback',
+                score.shaped + ' shaped,', score.plain + ' plain');
             this.stop();
             onFound(parent, null);
             return;
@@ -1155,7 +1195,7 @@
 
       const channel = document.createElement('span');
       channel.className = 'ute-panel-channel';
-      channel.textContent = Store.channel ? `#${Store.channel}` : 'channel not detected';
+      channel.textContent = Store.channel || 'channel not detected';
 
       const button = (label, onClick) => {
         const b = document.createElement('button');
@@ -1167,18 +1207,8 @@
 
       panel.append(
         counts, channel,
-        button('Set channel', () => {
-          const v = prompt('Twitch channel for this page:', Store.channel || '');
-          if (!v) return;
-          const login = v.trim().replace(/^#/, '').toLowerCase();
-          gmSet(`ute:manual:${location.hostname}${location.pathname}`, login);
-          Store.load(login);
-        }),
-        button('Reload emotes', () => {
-          gmSet(`ute:emotes:${Store.channel || '__global__'}`, null);
-          Store.signature = '';
-          Store.load(Store.channel);
-        }),
+        button('Set channel', promptForChannel),
+        button('Reload emotes', forceReload),
       );
       return panel;
     },
@@ -1354,7 +1384,10 @@
             ev.stopPropagation();
             const target = picker.querySelector(`[data-ute-section="${group.provider}"]`);
             if (target && typeof target.scrollIntoView === 'function') {
-              target.scrollIntoView({ block: 'start', behavior: 'smooth' });
+              // 'instant' rather than 'smooth', and explicit rather than
+              // 'auto', so a scroll-behavior rule on the container can't
+              // reintroduce the glide. Twitch's own tabs jump.
+              target.scrollIntoView({ block: 'start', behavior: 'instant' });
             }
           });
         }
@@ -1462,7 +1495,6 @@
     .ute-panel {
       display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
       margin: 4px 0 2px; padding: 6px 10px;
-      border-block: 1px solid rgba(255, 255, 255, .08);
       font: 11px/1.5 Inter, Roobert, Helvetica, sans-serif; color: #adadb8;
     }
     .ute-panel-counts { color: #efeff1; }
@@ -1475,8 +1507,8 @@
     .ute-panel button:focus-visible { outline: 2px solid #bf94ff; outline-offset: 1px; }
     .ute-nav-item { position: relative; }
     .ute-nav-tag {
-      position: absolute; inset-inline: 1px; bottom: 1px;
-      text-align: center; border-radius: 2px;
+      position: absolute; bottom: 1px; left: 50%; transform: translateX(-50%);
+      padding: 0 3px; border-radius: 2px; white-space: nowrap;
       background: rgba(0, 0, 0, .82); color: #fff;
       font: 700 7px/10px Inter, Roobert, Helvetica, sans-serif;
       letter-spacing: .03em; pointer-events: none;
@@ -1614,12 +1646,43 @@
       return 'var(--color-background-input, #18181b)';
     },
 
-    /** Token holding the caret is left as text, so a code stays editable. */
+    /**
+     * Token holding the caret is left as text, so a code stays editable.
+     *
+     * A collapsed selection is not always anchored on a text node: once the
+     * editor re-renders, browsers report the anchor as the ELEMENT with an
+     * offset counting children. Comparing that against a text node never
+     * matched, so the token got painted while the card also showed it — the
+     * emote appearing twice.
+     */
     caretToken() {
       const sel = window.getSelection();
       if (!sel || !sel.isCollapsed || !sel.anchorNode) return null;
-      if (!this.editable.contains(sel.anchorNode)) return null;
-      return { node: sel.anchorNode, offset: sel.anchorOffset };
+
+      let node = sel.anchorNode;
+      let offset = sel.anchorOffset;
+
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const edge = (from, wantLast) => {
+          if (!from) return null;
+          if (from.nodeType === Node.TEXT_NODE) return from;
+          if (from.nodeType !== Node.ELEMENT_NODE) return null;
+          const walk = document.createTreeWalker(from, NodeFilter.SHOW_TEXT);
+          let found = null, n;
+          while ((n = walk.nextNode())) { found = n; if (!wantLast) break; }
+          return found;
+        };
+        // The caret sits between children; prefer the text just before it.
+        const previous = edge(node.childNodes[offset - 1], true);
+        const next = previous ? null : edge(node.childNodes[offset], false);
+        const resolved = previous || next;
+        if (!resolved) return null;
+        node = resolved;
+        offset = previous ? node.nodeValue.length : 0;
+      }
+
+      if (!this.editable.contains(node)) return null;
+      return { node, offset };
     },
 
     render() {
@@ -1698,82 +1761,64 @@
   };
 
   /* ══════════════════════════════════════════════════════════════════════════
-   * 10. HUD
+   * 10. MENU COMMANDS
+   *
+   * The two controls that have to exist everywhere — switch channel, reload
+   * emotes — live in the userscript manager's own menu rather than in a
+   * floating panel on the page.
+   *
+   * The panel this replaces was drawn on every page where a chat log was
+   * detected, which is not the same set as "pages with chat": the structural
+   * detector is deliberately generous, so a semi-transparent pill turned up on
+   * ordinary sites. A manager menu has no such failure mode, costs no DOM, and
+   * can't overlap anything.
+   *
+   * Labels carry the state, so there is no status-only entry doing nothing
+   * when clicked. On twitch.tv the picker's status row shows the same numbers.
    * ════════════════════════════════════════════════════════════════════════ */
 
-  const Hud = {
-    el: null,
+  /** Ask for a channel and remember it for this page. */
+  function promptForChannel() {
+    const value = prompt('Twitch channel for this page:', Store.channel || '');
+    if (!value) return;
+    const login = value.trim().replace(/^#/, '').toLowerCase();
+    if (!login) return;
+    gmSet(`ute:manual:${location.hostname}${location.pathname}`, login);
+    Store.load(login);
+  }
 
-    mount(pickerHostsControls) {
-      const wanted = CONFIG.showHud === true
-        || (CONFIG.showHud === 'auto' && !pickerHostsControls);
-      if (!wanted || this.el || !document.body) return;
-      addStyle(`
-        #ute-hud {
-          position: fixed; right: 8px; bottom: 8px; z-index: 2147483000;
-          font: 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-          color: #cfd2dc; background: rgba(18,18,22,.82);
-          border: 1px solid rgba(255,255,255,.10); border-radius: 4px;
-          padding: 3px 7px; opacity: .32; cursor: pointer;
-          transition: opacity .15s ease; user-select: none; backdrop-filter: blur(4px);
-        }
-        #ute-hud:hover, #ute-hud.ute-open { opacity: 1; }
-        #ute-hud .ute-panel { display: none; margin-top: 6px; min-width: 170px; }
-        #ute-hud.ute-open .ute-panel { display: block; }
-        #ute-hud .ute-row { display: flex; justify-content: space-between; gap: 10px; padding: 1px 0; }
-        #ute-hud .ute-row span:last-child { color: #8b8f9c; }
-        #ute-hud button {
-          all: unset; display: block; width: 100%; box-sizing: border-box;
-          margin-top: 4px; padding: 3px 6px; text-align: center;
-          border: 1px solid rgba(255,255,255,.12); border-radius: 3px;
-          color: #cfd2dc; cursor: pointer; font: inherit;
-        }
-        #ute-hud button:hover { background: rgba(255,255,255,.07); }
-      `);
-      const el = document.createElement('div');
-      el.id = 'ute-hud';
-      el.innerHTML = '<div class="ute-head">emotes: …</div><div class="ute-panel"></div>';
-      el.addEventListener('click', e => {
-        if (e.target.tagName === 'BUTTON') return;
-        el.classList.toggle('ute-open');
-      });
-      document.body.appendChild(el);
-      this.el = el;
-      this.update();
+  /** Drop the cache and refetch, for an emote added mid-stream. */
+  function forceReload() {
+    gmSet(`ute:emotes:${Store.channel || '__global__'}`, null);
+    Store.signature = '';
+    Store.load(Store.channel);
+  }
+
+  const Menu = {
+    ids: [],
+
+    available() { return typeof GM_registerMenuCommand === 'function'; },
+
+    register() {
+      if (!this.available()) return;
+      this.unregister();
+      const channel = Store.channel ? `currently ${Store.channel}` : 'none detected';
+      const total = Store.map.size;
+      try {
+        this.ids.push(GM_registerMenuCommand(`Set channel — ${channel}`, promptForChannel));
+        this.ids.push(GM_registerMenuCommand(`Reload emotes — ${total} loaded`, forceReload));
+      } catch (e) { log('menu registration failed:', e.message); }
     },
 
-    update() {
-      if (!this.el) return;
-      const c = Store.counts;
-      const total = Store.map.size;
-      this.el.querySelector('.ute-head').textContent =
-        `emotes ${total}${Store.channel ? ' · ' + Store.channel : ''}`;
-
-      const rows = [
-        ['7TV', (c['7tv-global'] || 0) + (c['7tv-channel'] || 0)],
-        ['BTTV', (c['bttv-global'] || 0) + (c['bttv-channel'] || 0)],
-        ['FFZ', (c['ffz-global'] || 0) + (c['ffz-channel'] || 0)],
-      ].map(([k, v]) => `<div class="ute-row"><span>${k}</span><span>${v}</span></div>`).join('');
-
-      const panel = this.el.querySelector('.ute-panel');
-      panel.innerHTML = rows +
-        `<div class="ute-row"><span>id</span><span>${Store.channelId || '—'}</span></div>` +
-        '<button data-act="set">Set channel</button>' +
-        '<button data-act="reload">Reload emotes</button>';
-
-      panel.querySelector('[data-act="set"]').onclick = () => {
-        const v = prompt('Twitch channel name for this page:', Store.channel || '');
-        if (!v) return;
-        const login = v.trim().replace(/^#/, '').toLowerCase();
-        gmSet(`ute:manual:${location.hostname}${location.pathname}`, login);
-        Store.load(login);
-      };
-      panel.querySelector('[data-act="reload"]').onclick = () => {
-        gmSet(`ute:emotes:${Store.channel || '__global__'}`, null);
-        Store.load(Store.channel);
-      };
+    unregister() {
+      if (typeof GM_unregisterMenuCommand !== 'function') { this.ids = []; return; }
+      for (const id of this.ids) {
+        try { GM_unregisterMenuCommand(id); } catch (e) { /* already gone */ }
+      }
+      this.ids = [];
     },
   };
+
 
   /* ══════════════════════════════════════════════════════════════════════════
    * 11. BOOTSTRAP
@@ -1796,15 +1841,14 @@
     if (booted) return;
     booted = true;
 
-    const pickerHostsControls = profile === 'twitch' && CONFIG.pickerSections && CONFIG.pickerPanel;
-    Hud.mount(pickerHostsControls);
+    Menu.register();
     Renderer.attach(root, messages);
     if (profile === 'twitch') { Picker.start(); Composer.start(); }
 
     const login = resolveChannel();
     if (!login) {
       warn('chat found but channel unknown — loading global emotes only. ' +
-           'Use the HUD to set the channel, or add a channelOverrides entry.');
+           'Set it from the userscript manager menu, or add a channelOverrides entry.');
     }
     await Store.load(login);
     Renderer.reprocessAll();
