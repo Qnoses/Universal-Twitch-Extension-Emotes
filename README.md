@@ -29,7 +29,8 @@ This covers every place Twitch renders chat text, not only the message list —
 pinned messages, hype chat and other community highlights sit in a separate
 stack above it, and are matched by the same
 `data-a-target="chat-message-text"` hook every Twitch message form uses.
-Hovering a rendered emote shows a small card with its name and provider.
+Hovering a rendered emote shows a small card with its name and provider — the
+same card the chat box and the emote picker use.
 
 Channel emotes win over global emotes when a code collides, matching what the
 real extensions do. **Zero-width emotes stack** rather than sitting side by
@@ -149,10 +150,13 @@ which also shows the current channel and emote count in its labels.
 
 On `twitch.tv`, the channel's 7TV, BetterTTV and FrankerFaceZ emotes are added
 to Twitch's emote menu as three further sections, placed directly below the
-channel's own native emotes so Twitch's keep top billing. Clicking one inserts
-its code into the chat box, the picker's search box filters them alongside
-Twitch's, and each provider gets a tab on the right-hand nav rail that jumps to
-its section.
+channel's own native emotes so Twitch's keep top billing. Clicking one appends
+its code to the end of the message, with a space before it unless the box is
+empty or already ends in one, and a space after. Hovering shows the same card
+the chat box uses, below the emote as Twitch places its own. The picker's
+search box filters these sections alongside Twitch's, and each provider gets a
+tab on the right-hand nav rail that jumps to its section and takes the
+selected-tab highlight while it's there.
 
 Each tab reuses the channel's own icon with the provider tagged in the corner,
 so they read as siblings of Twitch's tabs rather than foreign objects, and they
@@ -270,8 +274,8 @@ changes.
 - `providers` (default all `true`) — `sevenTV`, `bttv`, `ffz`. Switching one off
   skips its network calls entirely.
 - `hoverCard` (default `true`) — show a small card with the emote's name and
-  provider when you hover a rendered emote. `false` falls back to a plain
-  browser tooltip.
+  provider when you hover one, in chat and in the emote picker. `false` falls
+  back to a plain browser tooltip.
 - `priority` — the order codes overwrite each other. Later entries win, so the
   default puts channel sets above globals.
 - `cacheTTL` (default 30 minutes) — how long emote lists are reused before a

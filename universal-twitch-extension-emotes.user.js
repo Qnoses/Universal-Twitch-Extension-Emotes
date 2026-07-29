@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      2.5
+// @version      2.6
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -564,7 +564,7 @@
       return el;
     },
 
-    show(img) {
+    show(img, below) {
       const el = this.ensure();
       el.querySelector('img').src = img.currentSrc || img.src;
       el.querySelector('.ute-card-code').textContent = img.dataset.uteCode || img.alt || '';
@@ -573,8 +573,10 @@
 
       const r = img.getBoundingClientRect();
       const vw = document.documentElement.clientWidth || window.innerWidth;
-      let top = r.top - el.offsetHeight - 6;
-      if (top < 4) top = r.bottom + 6;       // no room above: flip below
+      // In the picker Twitch puts its own tooltip below the emote; in chat
+      // there is rarely room below, so that stays above.
+      let top = below ? r.bottom + 6 : r.top - el.offsetHeight - 6;
+      if (!below && top < 4) top = r.bottom + 6;
       const left = Math.max(4, Math.min(
         r.left + r.width / 2 - el.offsetWidth / 2, vw - el.offsetWidth - 4));
       el.style.top = Math.round(top) + 'px';
@@ -988,21 +990,67 @@
    * beforeinput, which is exactly what execCommand('insertText') produces —
    * deprecated, but it's the one path that drives Slate's model correctly.
    */
-  function insertIntoChatInput(code) {
-    const editor = document.querySelector(PSEL.input);
-    if (!editor) return false;
+  /**
+   * The message as actually typed. editor.textContent is not that: it also
+   * picks up the zero-width padding Slate inserts and the accessible label
+   * inside each committed emote's void node, so a box holding one emote read
+   * as the text "Kappa". Only [data-slate-string] spans carry real characters.
+   */
+  function composerText(editor) {
+    let out = '';
+    for (const leaf of editor.querySelectorAll('[data-slate-string="true"]')) {
+      if (leaf.closest(PSEL.nativeEmote)) continue;
+      out += leaf.textContent || '';
+    }
+    return out.replace(/\uFEFF/g, '');
+  }
 
-    editor.focus();
-    const sel = window.getSelection();
+  /**
+   * Put the caret at the end of the message, on a text node Slate owns.
+   *
+   * Collapsing to the end of the editable's contents is not the same thing:
+   * when the message ends in an emote, that lands inside the void node's
+   * spacer, and Slate cannot resolve a model position from there — which is
+   * where the odd insertion behaviour came from.
+   */
+  function caretToEnd(editor) {
+    const leaves = Array.from(editor.querySelectorAll('[data-slate-node="text"]'))
+      .filter(el => !el.closest(PSEL.nativeEmote));
     const range = document.createRange();
-    range.selectNodeContents(editor);
+    const last = leaves[leaves.length - 1];
+
+    if (last) {
+      const walk = document.createTreeWalker(last, NodeFilter.SHOW_TEXT);
+      let node = null, n;
+      while ((n = walk.nextNode())) node = n;
+      if (node) range.setStart(node, node.nodeValue.length);
+      else range.selectNodeContents(last);
+    } else {
+      range.selectNodeContents(editor);
+    }
     range.collapse(false);
+
+    const sel = window.getSelection();
     sel.removeAllRanges();
     sel.addRange(range);
+  }
 
-    // Slate pads empty editors with a zero-width no-break space.
-    const current = (editor.textContent || '').replace(/\uFEFF/g, '');
-    const lead = current.length && !/\s$/.test(current) ? ' ' : '';
+  /**
+   * Insert an emote code at the end of the message: a space before it unless
+   * the box is empty or already ends in whitespace, and always a space after.
+   */
+  function insertIntoChatInput(code) {
+    const editor = document.querySelector(PSEL.input);
+    if (!editor || !editor.isConnected) return false;
+
+    editor.focus({ preventScroll: true });
+    caretToEnd(editor);
+
+    const typed = composerText(editor);
+    // A committed emote is not text but is still content, so a code following
+    // it needs its separating space.
+    const hasContent = typed.length > 0 || !!editor.querySelector(PSEL.nativeEmote);
+    const lead = hasContent && !/\s$/.test(typed) ? ' ' : '';
     const text = lead + code + ' ';
 
     let ok = false;
@@ -1020,6 +1068,7 @@
     sections: [],
     panel: null,
     query: '',
+    activeProvider: null,   // survives the picker being closed and reopened
     queued: false,
 
     start() {
@@ -1138,6 +1187,7 @@
       }
 
       this.wireSearch(picker);
+      this.wireHoverCards(picker);
       this.injectNav(picker, groups);
       log('picker: added', this.sections.length, 'sections');
     },
@@ -1278,21 +1328,44 @@
       cell.dataset.uteCode = emote.code.toLowerCase();
       button.setAttribute('aria-label', emote.code);
       button.setAttribute('name', emote.code);
-      button.setAttribute('title', `${emote.code} — ${group.label}`);
+      if (!CONFIG.hoverCard) button.setAttribute('title', `${emote.code} — ${group.label}`);
       // Retarget Twitch's own hooks so nothing of theirs tries to claim it.
       button.setAttribute('data-a-target', 'ute-emote-button');
       button.removeAttribute('data-test-selector');
 
       img.src = emote.url;
       img.alt = emote.code;
+      // Deliberately no data-ute-code here: that attribute counts cells, and
+      // duplicating it on the image doubled every cell count and search filter.
+      // alt already carries the code for the hover card.
+      img.dataset.uteSrc = group.label;
       if (emote.srcset) img.srcset = emote.srcset; else img.removeAttribute('srcset');
 
+      // Without this the composer is blurred on mousedown, before the click
+      // handler runs, and the caret we then place is discarded.
+      button.addEventListener('mousedown', ev => ev.preventDefault());
       button.addEventListener('click', ev => {
         ev.preventDefault();
         ev.stopPropagation();
         insertIntoChatInput(emote.code);
       });
       return cell;
+    },
+
+    /** One delegated pair of listeners for every cell in our sections. */
+    wireHoverCards(picker) {
+      if (!CONFIG.hoverCard || picker.dataset.uteHover === '1') return;
+      picker.dataset.uteHover = '1';
+      const at = e => {
+        if (!e.target || !e.target.closest) return null;
+        // Both the cell and its image carry data-ute-code, so closest() may
+        // land on either one.
+        const hit = e.target.closest('[data-ute-code]');
+        if (!hit) return null;
+        return hit.tagName === 'IMG' ? hit : hit.querySelector('img');
+      };
+      picker.addEventListener('mouseover', e => { const i = at(e); if (i) Tooltip.show(i, true); });
+      picker.addEventListener('mouseout', e => { if (at(e)) Tooltip.hide(); });
     },
 
     /**
@@ -1316,6 +1389,56 @@
           if (match) shown++;
         });
         section.style.display = shown ? '' : 'none';
+      }
+    },
+
+    /**
+     * Twitch marks the current tab with aria-current plus a pair of classes
+     * whose names are build-specific. Read them off the live active tab rather
+     * than hardcoding, so the highlight keeps working across restyles.
+     */
+    activeTokens(toolbar) {
+      const tokens = { wrapper: [], inner: [] };
+      const current = toolbar.querySelector('[aria-current="true"]');
+      if (!current) return tokens;
+      let wrapper = current;
+      while (wrapper && wrapper.parentElement !== toolbar) wrapper = wrapper.parentElement;
+      if (wrapper) {
+        tokens.wrapper = Array.from(wrapper.classList).filter(c => /active/i.test(c));
+      }
+      for (const el of current.querySelectorAll('*')) {
+        for (const c of el.classList) {
+          if (/active/i.test(c) && !tokens.inner.includes(c)) tokens.inner.push(c);
+        }
+      }
+      return tokens;
+    },
+
+    /** Highlight one of our tabs, and only one. */
+    setActiveTab(toolbar, provider) {
+      this.activeProvider = provider;
+      const tokens = this.tokens || { wrapper: [], inner: [] };
+      for (const item of toolbar.querySelectorAll('[data-ute-nav]')) {
+        const on = item.dataset.uteNav === provider;
+        const button = item.querySelector('button');
+        const inner = button && button.firstElementChild;
+        if (tokens.wrapper.length) item.classList.toggle(tokens.wrapper[0], on);
+        for (const c of tokens.wrapper.slice(1)) item.classList.toggle(c, on);
+        if (inner) for (const c of tokens.inner) inner.classList.toggle(c, on);
+        if (button) button.setAttribute('aria-current', on ? 'true' : 'false');
+      }
+      // Twitch's scroll spy will otherwise leave the channel tab lit as well,
+      // because our sections sit inside its scroll range. Best effort: it may
+      // re-apply on its next render.
+      if (provider) {
+        for (const native of toolbar.querySelectorAll('[aria-current="true"]')) {
+          if (native.closest('[data-ute-nav]')) continue;
+          native.setAttribute('aria-current', 'false');
+          let wrapper = native;
+          while (wrapper && wrapper.parentElement !== toolbar) wrapper = wrapper.parentElement;
+          if (wrapper) tokens.wrapper.forEach(c => wrapper.classList.remove(c));
+          native.querySelectorAll('*').forEach(el => tokens.inner.forEach(c => el.classList.remove(c)));
+        }
       }
     },
 
@@ -1345,6 +1468,17 @@
       const source = this.navChannelTab(toolbar);
       if (!source) return;                       // too early; retry next check
 
+      this.tokens = this.activeTokens(toolbar);
+
+      // Clicking a native tab means Twitch owns the highlight again.
+      if (toolbar.dataset.uteNavWired !== '1') {
+        toolbar.dataset.uteNavWired = '1';
+        toolbar.addEventListener('click', e => {
+          const item = e.target && e.target.closest ? e.target.closest('[role="toolbar"] > *') : null;
+          if (item && !item.hasAttribute('data-ute-nav')) this.setActiveTab(toolbar, null);
+        }, true);
+      }
+
       const existing = toolbar.querySelectorAll('[data-ute-nav]');
       const placed = existing.length === groups.length
         && existing[0].previousElementSibling === source;
@@ -1358,6 +1492,13 @@
         item.classList.add('ute-nav-item');
         item.dataset.uteNav = group.provider;
         item.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+        // The channel tab may well be the active one, and its active classes
+        // would otherwise come along with the clone — which is why every tab
+        // looked selected after reopening the picker.
+        const strip = el => Array.from(el.classList)
+          .filter(c => /active/i.test(c)).forEach(c => el.classList.remove(c));
+        strip(item);
+        item.querySelectorAll('*').forEach(strip);
 
         // Reuse the channel's own icon, tagged in the corner, so these read as
         // siblings of Twitch's tabs rather than foreign objects.
@@ -1382,6 +1523,7 @@
           button.addEventListener('click', ev => {
             ev.preventDefault();
             ev.stopPropagation();
+            this.setActiveTab(toolbar, group.provider);
             const target = picker.querySelector(`[data-ute-section="${group.provider}"]`);
             if (target && typeof target.scrollIntoView === 'function') {
               // 'instant' rather than 'smooth', and explicit rather than
@@ -1394,6 +1536,8 @@
         ref.parentNode.insertBefore(item, ref.nextSibling);
         ref = item;
       }
+      // Restore whatever was selected when the picker was last closed.
+      if (this.activeProvider) this.setActiveTab(toolbar, this.activeProvider);
       log('picker: nav tabs placed below the channel tab');
     },
   };
