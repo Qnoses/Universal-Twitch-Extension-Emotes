@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      2.8
+// @version      3.0
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -98,6 +98,11 @@
     composerPreview: true,
     // Show a preview card above the input for the code under the caret.
     composerBubble: true,
+    // Turn the browser's spellchecker off in Twitch's chat box, so third-party
+    // codes stop being underlined as misspellings. This is only the default:
+    // the toggle in the picker panel and in the userscript manager's menu
+    // remembers its own choice, and once made that choice wins over this line.
+    disableSpellcheck: false,
     // Per-host channel overrides, for sites where the channel isn't inferable.
     // e.g. 'chat.example.com': 'forsen'
     channelOverrides: {},
@@ -120,6 +125,13 @@
 
   const log = (...a) => CONFIG.debug && console.log('%c[UTE]', 'color:#8b5cf6', ...a);
   const warn = (...a) => console.warn('[UTE]', ...a);
+
+  // True in a twitch.tv document, which includes every embed and popout iframe
+  // — those are twitch.tv documents too, which is the whole premise up top.
+  // The picker, the composer preview and the spellcheck toggle are all gated
+  // on this: they key on Twitch's own markup and have nothing to act on
+  // anywhere else.
+  const isTwitch = () => /(^|\.)twitch\.tv$/i.test(location.hostname);
 
   const gmGet = (k, d) => {
     try { if (typeof GM_getValue === 'function') return GM_getValue(k, d); } catch (e) { /* noop */ }
@@ -421,7 +433,6 @@
   const Store = {
     map: new Map(),        // code → Emote
     channel: null,
-    channelId: null,
     counts: {},
     signature: '',
 
@@ -430,10 +441,8 @@
       const cached = gmGet(cacheKey, null);
       const age = cached ? Date.now() - cached.ts : Infinity;
       if (cached && age < CONFIG.cacheTTL) {
-        this.ingest(cached.emotes);
-        this.channel = login;
-        log('cache hit', login, this.map.size);
-        Menu.register();
+        log('cache hit', login, cached.emotes.length);
+        this.adopt(cached.emotes, login);
         // Only reach out again once the cache is genuinely ageing. Refreshing
         // on every page view meant six API calls per Twitch tab for emotes we
         // already had.
@@ -441,6 +450,44 @@
         return;
       }
       await this.fetchAll(login, cacheKey);
+    },
+
+    /**
+     * Make a set of emotes the current one and tell everything drawn from it.
+     *
+     * This exists because load() has two exits and only one of them used to say
+     * so. A fetch ingested, then rebuilt the chat, the picker and the composer;
+     * a cache hit ingested and returned. At boot that difference is invisible,
+     * since the renderer attaches and seeds itself afterwards either way — but
+     * "Set channel" calls load() with nothing following it, so switching to a
+     * channel visited inside the half-hour TTL loaded the right emotes into the
+     * map and then drew none of them. The bug was not a missing call so much as
+     * a second path that quietly did not have to make one.
+     *
+     * The unchanged-signature guard moved in here with it, and now covers both
+     * exits rather than only the fetch. A channel change loads twice — the URL
+     * watcher immediately, then boot 500ms later once chat has remounted — and
+     * the second of those is now recognised as the no-op it is instead of
+     * rebuilding every section a second time.
+     */
+    adopt(emotes, login) {
+      if (this.channel === login && emoteSignature(emotes) === this.signature) {
+        log('emotes unchanged; nothing to rebuild');
+        // Still worth a pass: the labels carry the channel, and a first load on
+        // a page that resolved the same channel has not written them yet.
+        Menu.register();
+        Picker.syncPanel();
+        return false;
+      }
+      this.ingest(emotes);
+      this.channel = login;
+      log('adopted', this.map.size, 'emotes for', login, this.counts);
+      Menu.register();
+      Renderer.reprocessAll();
+      Picker.refresh();
+      Picker.syncPanel();
+      Composer.schedule();
+      return true;
     },
 
     async fetchAll(login, cacheKey) {
@@ -452,7 +499,6 @@
         const res = await resolveTwitchId(login);
         channelId = res.id;
         ffzRoom = res.ffzRoom || null;
-        this.channelId = channelId;
       }
 
       const jobs = [];
@@ -483,18 +529,7 @@
       // new still buys another full TTL of quiet.
       gmSet(cacheKey, { ts: Date.now(), emotes });
 
-      if (this.channel === login && emoteSignature(emotes) === this.signature) {
-        log('emotes unchanged; skipping rebuild');
-        return;
-      }
-
-      this.ingest(emotes);
-      this.channel = login;
-      log('loaded', this.map.size, 'emotes for', login, this.counts);
-      Menu.register();
-      Renderer.reprocessAll();
-      Picker.refresh();
-      Composer.schedule();
+      this.adopt(emotes, login);
     },
 
     ingest(emotes) {
@@ -546,6 +581,23 @@
   `);
 
   /**
+   * Place a card above (or below) a rect, in viewport coordinates, clamped so
+   * it can't run off either edge. Shared by the hover tooltip and the composer
+   * bubble: both are fixed-position and measured, which is what keeps them out
+   * of every clipping and containing-block question in the chat UI.
+   */
+  function placeCard(el, rect, { below = false, align = 'center' } = {}) {
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    let top = below ? rect.bottom + 6 : rect.top - el.offsetHeight - 6;
+    if (!below && top < 4) top = rect.bottom + 6;
+    const x = align === 'start'
+      ? rect.left + 10
+      : rect.left + rect.width / 2 - el.offsetWidth / 2;
+    el.style.top = Math.round(top) + 'px';
+    el.style.left = Math.round(Math.max(4, Math.min(x, vw - el.offsetWidth - 4))) + 'px';
+  }
+
+  /**
    * Replaces the browser's `title` tooltip on rendered emotes with the same
    * card the chat box uses, so an emote reads the same wherever you meet it.
    */
@@ -566,21 +618,20 @@
 
     show(img, below) {
       const el = this.ensure();
-      el.querySelector('img').src = img.currentSrc || img.src;
+      const src = img.currentSrc || img.src;
+      const pic = el.querySelector('img');
+      // Written only when it changes. Assigning the same value to src re-runs
+      // the image request, and an animated emote comes back from that at its
+      // first frame — so a card refreshed while it is already open shows a
+      // still. See Composer.showBubble, where that refresh is constant.
+      if (pic.getAttribute('src') !== src) pic.src = src;
       el.querySelector('.ute-card-code').textContent = img.dataset.uteCode || img.alt || '';
       el.querySelector('.ute-card-src').textContent = img.dataset.uteSrc || '';
       el.classList.add('ute-on');            // measure only once it's laid out
 
-      const r = img.getBoundingClientRect();
-      const vw = document.documentElement.clientWidth || window.innerWidth;
       // In the picker Twitch puts its own tooltip below the emote; in chat
       // there is rarely room below, so that stays above.
-      let top = below ? r.bottom + 6 : r.top - el.offsetHeight - 6;
-      if (!below && top < 4) top = r.bottom + 6;
-      const left = Math.max(4, Math.min(
-        r.left + r.width / 2 - el.offsetWidth / 2, vw - el.offsetWidth - 4));
-      el.style.top = Math.round(top) + 'px';
-      el.style.left = Math.round(left) + 'px';
+      placeCard(el, img.getBoundingClientRect(), { below });
     },
 
     hide() { if (this.el) this.el.classList.remove('ute-on'); },
@@ -588,12 +639,43 @@
 
   /**
    * Nothing under these is chat, and some of it is ours. The chat root is the
-   * whole chat room, so the composer's own preview card lives inside it: when
-   * that card wrote the emote's name into itself, the observer saw a new text
-   * node and painted a second copy of the emote over it.
+   * whole chat room, so our own cards and overlays live inside it: when the
+   * composer's preview card wrote the emote's name into itself, the observer
+   * saw a new text node and painted a second copy of the emote over it.
+   *
+   * .chat-input is here because the composer owns its own overlay, the emote
+   * picker is not chat, and the surrounding furniture is full of short words
+   * — "Chat", "Reply", "Cancel", "Thread" — that a channel could easily have
+   * an emote for. Rendering one onto the send button is not an improvement.
    */
   const NOT_CHAT = 'input, textarea, [contenteditable="true"], ' +
-                   '.ute-wrap, .ute-card, .ute-panel, .chat-input';
+                   '.ute-wrap, .ute-card, .ute-panel, .ute-composer-layer, ' +
+                   '.emote-picker, [data-a-target="chat-emote-picker"], .chat-input';
+
+  /**
+   * The one exception to that. Twitch's reply-thread tray mounts *inside*
+   * .chat-input, and the parent message and its replies in there are ordinary
+   * chat lines in ordinary chat markup — so the blanket exclusion above was
+   * throwing away real chat. Matching the line rather than the tray keeps the
+   * carve-out narrow: the tray's own chrome, and every other tray Twitch
+   * mounts in that slot (bits, polls, predictions, raids), stays excluded.
+   *
+   * Deliberately kept in step with the twitch profile's `messages` selector
+   * below; both key on the same hooks Twitch's own tooling uses.
+   */
+  const CHAT_IN_INPUT = '.chat-line__message, .chat-line__status, .user-notice-line, ' +
+                        '[data-a-target="chat-line-message"], ' +
+                        '[data-a-target="chat-message-text"]';
+
+  /** True when the renderer must not write anywhere inside this element. */
+  function offLimits(el) {
+    const blocker = el.closest(NOT_CHAT);
+    if (!blocker) return false;
+    // Anything nearer than .chat-input — the editable, the picker, our own
+    // nodes — is off limits outright.
+    if (!blocker.matches('.chat-input')) return true;
+    return !el.closest(CHAT_IN_INPUT);
+  }
 
   const blobCache = new Map();
 
@@ -633,7 +715,9 @@
   }
 
   const Renderer = {
-    roots: new Set(),
+    // root → messageSelector | null. A Set lost the selector, which left
+    // reprocessAll guessing at the shape of the tree it was walking.
+    roots: new Map(),
 
     /**
      * Replace emote codes inside one text node.
@@ -689,10 +773,10 @@
       if (el.dataset.uteDone === '1') return;
       if (!Store.map.size) return;
 
-      // Never touch inputs, links, or the emote nodes we already made. The
-      // whole of .chat-input is off limits: the composer owns its own overlay
-      // and the emote picker is not chat.
-      if (el.closest(NOT_CHAT)) return;
+      // Never touch inputs, links, or the emote nodes we already made — nor
+      // .chat-input, save for the chat lines Twitch's reply-thread tray mounts
+      // there. See offLimits.
+      if (offLimits(el)) return;
 
       const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
         acceptNode(n) {
@@ -719,14 +803,14 @@
 
     attach(root, messageSelector) {
       if (this.roots.has(root)) return;
-      this.roots.add(root);
+      this.roots.set(root, messageSelector || null);
       root.dataset.uteRoot = '1';
       log('attached to', root, messageSelector);
 
       const handle = nodes => {
         for (const node of nodes) {
           if (node.nodeType === Node.TEXT_NODE) {
-            if (node.parentElement && !node.parentElement.closest(NOT_CHAT)) {
+            if (node.parentElement && !offLimits(node.parentElement)) {
               this.replaceTextNode(node);
             }
             continue;
@@ -767,16 +851,49 @@
       root.__uteObserver = obs;
     },
 
+    /**
+     * Turn our rendered emotes back into the codes they replaced, so a
+     * reprocess starts from the text again. Without this a refresh that
+     * changed a set left the old pictures in place: an emote the channel
+     * dropped kept rendering, and one whose URL moved kept the stale image.
+     *
+     * Same React contract as everywhere else — .ute-wrap is ours, so removing
+     * it is removing our own node, and React never knew it was there. The
+     * codes come back space-joined, which also restores the separator a
+     * zero-width overlay swallowed on the way in.
+     */
+    unwrap(root) {
+      for (const wrap of root.querySelectorAll('.ute-wrap')) {
+        const codes = Array.from(wrap.querySelectorAll('img.ute-emote'))
+          .map(img => img.dataset.uteCode || img.alt)
+          .filter(Boolean);
+        if (!codes.length) { wrap.remove(); continue; }
+        wrap.replaceWith(document.createTextNode(codes.join(' ')));
+      }
+    },
+
+    /**
+     * Deliberately no normalize() on the result: merging text nodes React is
+     * tracking separately is the kind of write this script exists to avoid,
+     * and splitting on whitespace means a re-split token still matches.
+     */
     reprocessAll() {
-      for (const root of this.roots) {
+      for (const [root, selector] of this.roots) {
+        this.unwrap(root);
         root.querySelectorAll('[data-ute-done="1"]').forEach(el => delete el.dataset.uteDone);
+        if (selector) {
+          root.querySelectorAll(selector).forEach(el => this.processMessage(el));
+          continue;
+        }
+        // No profile, so no selector: fall back to walking the top of the tree,
+        // which is what the generic detector hands us.
         Array.from(root.children).forEach(c => this.processMessage(c));
         root.querySelectorAll(':scope > * > *').forEach(c => this.processMessage(c));
       }
     },
 
     detachAll() {
-      for (const root of this.roots) {
+      for (const root of this.roots.keys()) {
         if (root.__uteObserver) root.__uteObserver.disconnect();
         delete root.dataset.uteRoot;
       }
@@ -954,6 +1071,9 @@
   const PSEL = {
     picker: '[data-a-target="chat-emote-picker"], .emote-picker',
     header: '.emote-grid-section__header-title',
+    // Present in both the category list and the search view, which is what
+    // makes it usable as the search view's insertion anchor.
+    block: '.emote-picker__content-block',
     grid: '.emote-grid',
     lock: '[data-test-selector="badge-button-lock"]',
     search: 'input[type="search"]',
@@ -963,6 +1083,11 @@
     nativeEmote: '[data-a-target="wysiwyg-chat-input-emote"], [data-slate-void="true"]',
     nativePreview: '[data-a-target="chat-input-emote-preview"]',
   };
+
+  // Twitch heads its search view "Search Results for …", which stops being true
+  // of that one block the moment our sections sit below it — those are search
+  // results too. Renamed to say which emotes the block actually holds.
+  const TWITCH_RESULTS_LABEL = 'Twitch Emotes';
 
   // Colours are chosen for contrast against the picker's dark background.
   // They are not official brand colours, just distinguishable section markers.
@@ -975,6 +1100,11 @@
     { provider: 'ffz-global',   label: 'FrankerFaceZ Global Emotes',  tag: 'FFZ',  letter: 'F', color: '#3f4a63', global: true },
   ];
 
+  /**
+   * Fallback icon for a nav tab, used only when the channel's own tab has an
+   * image element with no usable source. Section headers deliberately carry no
+   * icon at all — see buildSection.
+   */
   function badgeIcon(letter, color) {
     const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 28 28">' +
       `<rect width="28" height="28" rx="6" fill="${color}"/>` +
@@ -1101,6 +1231,10 @@
     hostObserver: null,
     sections: [],
     panel: null,
+    // Last successful template harvest, for views that offer nothing to clone.
+    cache: null,
+    // Which view the current sections were built for; see check().
+    searching: false,
     query: '',
     queued: false,
 
@@ -1128,6 +1262,7 @@
     reset() {
       this.sections = [];
       this.panel = null;
+      this.searching = false;
       if (this.hostObserver) { this.hostObserver.disconnect(); this.hostObserver = null; }
     },
 
@@ -1135,13 +1270,150 @@
       const picker = document.querySelector(PSEL.picker);
       if (!picker) { this.sections = []; return; }
       if (!Store.map.size) return;
-      if (this.sections.length && this.sections.every(n => picker.contains(n))) {
+      // Re-asserted every pass rather than only on injection. The search box
+      // sits in a different React subtree from the sections list and re-renders
+      // on its own, so a listener attached once is a listener eventually lost —
+      // the same failure the nav rail has, and the reason typing in the search
+      // box stopped filtering our sections after Twitch re-rendered the input.
+      // Both of these are no-ops once correctly attached.
+      this.wireSearch(picker);
+      this.wireHoverCards(picker);
+      this.syncQuery(picker);
+
+      // A non-empty box is exactly what puts Twitch into the search view, so the
+      // query is a cheaper and more reliable read of which view we are in than
+      // anything in the DOM. It matters because the status row belongs in the
+      // category list and not in the search view: crossing between the two needs
+      // a rebuild rather than a reposition. Entering search forces one anyway —
+      // Twitch unmounts our sections — but leaving it does not, and without this
+      // the status row would never come back.
+      const searching = !!this.query;
+      const intact = this.sections.length && this.sections.every(n => picker.contains(n));
+      if (intact && searching === this.searching) {
         this.reanchor(picker);
         this.injectNav(picker, this.groups());   // no-op once correctly placed
+        this.relabelResults(picker);             // re-applied after a re-render
+        this.matchResultsSpacing(picker);
         return;
       }
       this.sections = [];
       try { this.inject(picker); } catch (e) { warn('picker injection failed:', e.message); }
+    },
+
+    /**
+     * Equalise the gap between heading and first row across all three groups in
+     * the search view. Twitch's results heading sits closer to its grid than a
+     * section heading does, so left alone the groups don't line up.
+     *
+     * The difference is measured, not assumed. It comes from two different
+     * styled-components rules, neither of whose values are knowable from the
+     * markup, and it moves with Twitch's chat font-size setting — so no fixed
+     * number would hold, and measuring closes whatever the discrepancy happens
+     * to be rather than a discrepancy we guessed at.
+     *
+     * This is the second and last place the script writes to Twitch's own DOM:
+     * an inline padding on its heading's wrapper. Both sides are cleared before
+     * measuring so repeated passes can't compound, and if React re-renders the
+     * block the padding goes with it and the next check puts it back.
+     */
+    matchResultsSpacing(picker) {
+      if (!this.searching) return;
+      // A section filtered down to nothing is display:none and measures zero.
+      const mine = this.sections.find(s => s.style.display !== 'none');
+      const block = this.resultsBlock(picker);
+      if (!mine || !block) return;
+
+      const ourHead = mine.querySelector(PSEL.header);
+      const theirTitle = this.headingOf(block);
+      const theirHead = theirTitle && theirTitle.parentElement;
+      if (!ourHead || !theirHead) return;
+
+      // Cleared on both sides first, so a previous pass can neither compound nor
+      // skew the reading.
+      theirHead.style.paddingBottom = '';
+      for (const s of this.sections) {
+        const h = s.querySelector(PSEL.header);
+        if (h) h.style.paddingBottom = '';
+      }
+
+      /**
+       * Measured from the title's own text down to the grid, not from the header
+       * element's box.
+       *
+       * The first version of this measured box to box and always read zero on
+       * both sides, which is why it changed nothing: the space under a heading is
+       * padding *inside* that header, and getBoundingClientRect returns the
+       * border box — so the header's bottom edge already sits below the gap,
+       * flush against the grid. Measuring from the text captures the padding
+       * wherever between the two it happens to live. Both grids carry identical
+       * classes, so whatever padding they hold of their own cancels out in the
+       * difference.
+       */
+      const gapBelowTitle = (b) => {
+        const title = this.headingOf(b);
+        const grid = b.querySelector(PSEL.grid);
+        if (!title || !grid) return null;
+        return grid.getBoundingClientRect().top - title.getBoundingClientRect().bottom;
+      };
+
+      const ours = gapBelowTitle(mine);
+      const theirs = gapBelowTitle(block);
+      if (ours === null || theirs === null) return;
+
+      // Clamped: a bad reading should leave the layout alone rather than shove a
+      // heading half the picker away from its emotes.
+      const delta = Math.max(-24, Math.min(24, Math.round(ours - theirs)));
+      log('picker spacing: ours', Math.round(ours), 'twitch', Math.round(theirs),
+          'delta', delta);
+      if (!delta) return;
+
+      if (delta > 0) {
+        theirHead.style.paddingBottom = delta + 'px';
+      } else {
+        // The other direction, should Twitch ever space its results heading more
+        // generously than a section's. Ours are our own nodes to style.
+        for (const s of this.sections) {
+          const h = s.querySelector(PSEL.header);
+          if (h) h.style.paddingBottom = -delta + 'px';
+        }
+      }
+    },
+    /**
+     * Rename Twitch's search-results heading. The first of the two places this
+     * script writes to Twitch's own DOM, and it does so as narrowly as it can:
+     * the existing text node's value is set rather than replaced, so the node
+     * React tracks stays the node React tracks and a later re-render can still
+     * update it — which is also how the label survives, since that re-render
+     * brings Twitch's own text back and the next check puts ours in again.
+     *
+     * The block is found by being a content block that has no section header and
+     * does have a grid. Every category section has a header, so this cannot
+     * reach one even if the view were misread.
+     */
+    relabelResults(picker) {
+      if (!this.searching || !this.sections.length) return;
+      const block = this.resultsBlock(picker);
+      if (!block || !block.querySelector(PSEL.grid)) return;
+      const title = this.headingOf(block);
+      const text = title && title.firstChild;
+      if (!text || text.nodeType !== Node.TEXT_NODE) return;
+      if (text.nodeValue === TWITCH_RESULTS_LABEL) return;
+      text.nodeValue = TWITCH_RESULTS_LABEL;
+      // Twitch mirrors the heading into a tooltip; leaving it would show the old
+      // wording on hover.
+      if (title.hasAttribute('title')) title.setAttribute('title', TWITCH_RESULTS_LABEL);
+    },
+
+    /**
+     * The input's live value is the authority, not the events we happened to
+     * hear. A keystroke that landed while our listener was detached, or a clear
+     * Twitch performed itself, would otherwise leave our sections filtered by a
+     * query that is no longer in the box.
+     */
+    syncQuery(picker) {
+      const input = picker.querySelector(PSEL.search);
+      const query = input ? input.value.trim().toLowerCase() : '';
+      if (query !== this.query) this.filter(query);
     },
 
     groups() {
@@ -1158,35 +1430,98 @@
         }));
     },
 
-    /** Harvest live markup to clone from, so no build hash is ever written down. */
+    /**
+     * Twitch's own block in the search view: a content block that isn't ours and
+     * carries no section header. Preferring one that has a grid keeps this off
+     * the lazy placeholder blocks at the foot of the category list, which are
+     * header-less too.
+     */
+    resultsBlock(picker) {
+      const blocks = Array.from(picker.querySelectorAll(PSEL.block))
+        .filter(b => !b.hasAttribute('data-ute-section') && !b.querySelector(PSEL.header));
+      return blocks.find(b => b.querySelector(PSEL.grid)) || blocks.pop() || null;
+    },
+
+    /**
+     * A block's heading, wherever it keeps it: category sections wrap it in
+     * .emote-grid-section__header-title, the search block has a bare <strong>.
+     * Cells are excluded so one can never be taken for the heading.
+     */
+    headingOf(block) {
+      return Array.from(block.querySelectorAll('strong'))
+        .find(s => !s.closest(PSEL.grid)) || null;
+    },
+
+    /**
+     * A cell to clone. Subscriber emotes render with a padlock overlay and ours
+     * are never locked, so a clean cell is preferred — searched across every
+     * grid in the picker, since all of them use the same cell shape and a grid
+     * whose first cell happens to be locked would otherwise force a bad
+     * template. The overlay is stripped either way, in case none was clean.
+     */
+    pickCell(picker, grid) {
+      const first = grid && grid.firstElementChild;
+      if (!first) return null;
+      let preferred = first;
+      for (const c of picker.querySelectorAll(PSEL.grid + ' > *')) {
+        if (c.closest('[data-ute-section]')) continue;   // never clone our own clones
+        if (!c.querySelector(PSEL.lock)) { preferred = c; break; }
+      }
+      const cell = preferred.cloneNode(true);
+      cell.querySelectorAll(PSEL.lock).forEach(n => n.remove());
+      return cell;
+    },
+
+    /**
+     * Harvest live markup to clone from, so no build hash is ever written down.
+     *
+     * The category list gives us a real section, header wrapper and all. The
+     * search view gives us none — no `.emote-grid-section__header-title` appears
+     * anywhere in it — so every successful harvest is kept and the search view is
+     * built from the last one. Its own results block is a content block with a
+     * heading and a grid and could be cloned instead, but shouldn't be: that
+     * heading is spaced more tightly than a section's, and copying it made our
+     * sections look cramped and unlike themselves in the category list.
+     */
     templates(picker) {
       // Our sections carry a header and a grid too, so they'd otherwise
       // qualify as templates and as the insertion anchor.
       const headers = Array.from(picker.querySelectorAll(PSEL.header))
         .filter(h => !h.closest('[data-ute-section]'));
-      if (!headers.length) return null;
 
       // Prefer a section whose header carries an avatar — that's the channel
       // section, and its shape is the one we're imitating.
       const blocks = headers.map(h => h.parentElement && h.parentElement.parentElement)
         .filter(b => b && b.querySelector(PSEL.grid));
-      if (!blocks.length) return null;
-      const block = blocks.find(b => b.querySelector(PSEL.header + ' img')) || blocks[blocks.length - 1];
 
-      const grid = block.querySelector(PSEL.grid);
-      const cellSource = grid.firstElementChild;
-      if (!cellSource) return null;
-
-      // Subscriber emotes render with a padlock overlay. Ours are never
-      // locked, so prefer a clean cell and strip the overlay either way.
-      let preferred = cellSource;
-      for (const c of picker.querySelectorAll(PSEL.grid + ' > *')) {
-        if (!c.querySelector(PSEL.lock)) { preferred = c; break; }
+      if (blocks.length) {
+        const block = blocks.find(b => b.querySelector(PSEL.header + ' img'))
+          || blocks[blocks.length - 1];
+        const cell = this.pickCell(picker, block.querySelector(PSEL.grid));
+        if (cell) {
+          // Detached copies, kept for the search view. Deliberately not cleared
+          // by reset(): these are build-artefact shapes, not channel state, and
+          // a fresh deploy arrives with a page load.
+          this.cache = { block: block.cloneNode(true), cell: cell.cloneNode(true) };
+          return { block, cell, container: block.parentElement, blocks };
+        }
       }
-      const cell = preferred.cloneNode(true);
-      cell.querySelectorAll(PSEL.lock).forEach(n => n.remove());
 
-      return { block, cell, container: block.parentElement, blocks };
+      // Search view. Nothing here is a section, and cloning Twitch's results
+      // block instead was a mistake: its heading sits directly on its grid,
+      // tighter than a section heading does, so our sections came out visibly
+      // cramped and inconsistent with how they look in the category list. The
+      // cached section is the right shape; the gap between it and Twitch's block
+      // is closed from the other end, by matchResultsSpacing.
+      const results = this.resultsBlock(picker);
+      if (!results || !results.parentNode) return null;
+      if (!this.cache) return null;
+      return {
+        block: this.cache.block,
+        cell: this.cache.cell,
+        container: results.parentNode,
+        anchor: results,
+      };
     },
 
     inject(picker) {
@@ -1201,9 +1536,17 @@
       const tpl = this.templates(picker);
       if (!tpl || !tpl.container) return;
 
-      let ref = this.anchorFor(picker) || tpl.blocks[tpl.blocks.length - 1];
+      let ref = this.anchorFor(picker)
+        || tpl.anchor
+        || (tpl.blocks && tpl.blocks[tpl.blocks.length - 1]);
+      if (!ref || !ref.parentNode) return;
 
-      if (CONFIG.pickerPanel) {
+      this.searching = !!this.query;
+
+      // No status row in the search view. It reads as a third result group
+      // wedged between Twitch's matches and ours, and the counts it shows are
+      // for the whole channel rather than for anything on screen.
+      if (CONFIG.pickerPanel && !this.searching) {
         const panel = this.buildPanel();
         ref.parentNode.insertBefore(panel, ref.nextSibling);
         this.panel = panel;
@@ -1219,9 +1562,9 @@
         ref = node;
       }
 
-      this.wireSearch(picker);
-      this.wireHoverCards(picker);
       this.injectNav(picker, groups);
+      this.relabelResults(picker);
+      this.matchResultsSpacing(picker);
       log('picker: added', this.sections.length, 'sections');
     },
 
@@ -1242,7 +1585,15 @@
       return blocks.find(b => b.querySelector(PSEL.header + ' img')) || blocks[blocks.length - 1] || null;
     },
 
-    /** Twitch mounts sections progressively; keep our position correct. */
+    /**
+     * Twitch mounts sections progressively; keep our position correct.
+     *
+     * This also carries the trip back from the search view. Our sections are
+     * inserted there as children of the scroll container, and can survive the
+     * results block being unmounted — so on the pass where the category list
+     * reappears, they are strays a level too high, and this puts them back
+     * below the channel section.
+     */
     reanchor(picker) {
       const anchor = this.anchorFor(picker);
       if (!anchor || anchor === this.sections[0]) return;
@@ -1258,48 +1609,123 @@
     },
 
     /**
-     * The status readout and its controls, hosted here rather than floating
-     * over the chat UI where they collided with Twitch's own buttons.
+     * The panel's controls, hosted here rather than floating over the chat UI
+     * where they collided with Twitch's own buttons.
+     *
+     * Three buttons on one row, each carrying its own state in its label. The
+     * separate readouts this replaces — the channel name as bare text beside a
+     * "Set channel" button, and a line of per-provider counts — said in two
+     * lines what a label can say in one, and the counts in particular read as a
+     * third thing to parse before reaching a control. Both now sit on the
+     * button they describe.
      */
     buildPanel() {
       const panel = document.createElement('div');
       panel.className = 'ute-panel';
       panel.dataset.utePanel = '1';
 
-      const c = Store.counts;
-      const total = n => n || 0;
-      const counts = document.createElement('span');
-      counts.className = 'ute-panel-counts';
-      counts.textContent = [
-        `7TV ${total(c['7tv-channel']) + total(c['7tv-global'])}`,
-        `BetterTTV ${total(c['bttv-channel']) + total(c['bttv-global'])}`,
-        `FrankerFaceZ ${total(c['ffz-channel']) + total(c['ffz-global'])}`,
-      ].join('  ·  ');
-
-      const channel = document.createElement('span');
-      channel.className = 'ute-panel-channel';
-      channel.textContent = Store.channel || 'channel not detected';
-
-      const button = (label, onClick) => {
+      const button = (mark, onClick) => {
         const b = document.createElement('button');
         b.type = 'button';
-        b.textContent = label;
+        b.dataset[mark] = '1';
         b.addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); onClick(); });
         return b;
       };
 
       panel.append(
-        counts, channel,
-        button('Set channel', promptForChannel),
-        button('Reload emotes', forceReload),
+        button('uteChannel', promptForChannel),
+        button('uteSpellcheck', () => Spellcheck.toggle()),
+        button('uteReload', forceReload),
       );
+      this.labelPanel(panel);
       return panel;
+    },
+
+    /**
+     * Every label in one place, so changing one needs no rebuild and the two
+     * callers cannot drift apart.
+     *
+     * Each button's tooltip and accessible name carry what the label has no
+     * room for — which for the channel is the part of the name the label had to
+     * cut, and for the other two is what the control actually does.
+     */
+    labelPanel(panel) {
+      const at = k => panel.querySelector(`[data-ute-${k}]`);
+
+      const channel = at('channel');
+      if (channel) {
+        // Cut in script rather than by max-width and text-overflow, because the
+        // limit is a number of characters and CSS has no unit for that: `ch` is
+        // the width of a zero, and in a proportional face a run of narrow
+        // letters would survive well past the cut while a run of wide ones
+        // would be clipped short of it.
+        const name = Store.channel;
+        const shown = !name ? 'N/A'
+          : name.length > 7 ? name.slice(0, 7) + '…'
+          : name;
+        channel.textContent = `Channel: ${shown}`;
+        const hint = name
+          ? `Emotes are loaded for ${name}. Click to use a different channel.`
+          : 'No channel could be detected for this page. Click to set one manually.';
+        channel.title = hint;
+        channel.setAttribute('aria-label', hint);
+      }
+
+      const spell = at('spellcheck');
+      if (spell) Spellcheck.labelButton(spell);
+
+      const reload = at('reload');
+      if (reload) {
+        // Summed off PICKER_GROUPS rather than from a second list of provider
+        // keys written out here: it already pairs every key with the short tag
+        // the nav rail uses, so the abbreviations in the label and the ones in
+        // the picker cannot drift, and a provider added there is counted here
+        // without being mentioned twice. Channel and global sets fold together
+        // because they share a tag.
+        const c = Store.counts;
+        const sums = new Map();
+        for (const g of PICKER_GROUPS) {
+          sums.set(g.tag, (sums.get(g.tag) || 0) + (c[g.provider] || 0));
+        }
+        reload.textContent = 'Reload: ' +
+          Array.from(sums, ([tag, count]) => `${tag} ${count}`).join(' · ');
+        const hint = 'Refetch every emote set.';
+        reload.title = hint;
+        reload.setAttribute('aria-label', hint);
+      }
+    },
+
+    /**
+     * Re-label an open panel in place.
+     *
+     * Deliberately not refresh(): that drops every section and rebuilds them,
+     * which for a channel with several hundred 7TV emotes is thousands of cells
+     * discarded to change one word. Nothing a label reports touches the emote
+     * grid, so nothing about the emote grid needs rebuilding.
+     */
+    syncPanel() {
+      if (this.panel) this.labelPanel(this.panel);
     },
 
     buildSection(tpl, group) {
       const block = tpl.block.cloneNode(true);
       block.dataset.uteSection = group.provider;
+      // querySelectorAll never returns the root, so the clone's own id has to
+      // go separately. Twitch's content blocks carry none today; duplicating
+      // one if that changes would be our bug, not theirs.
+      block.removeAttribute('id');
       block.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
+
+      const grid = block.querySelector(PSEL.grid);
+      if (!grid) return null;
+
+      const title = this.headingOf(block);
+      if (title) {
+        title.textContent = group.label;
+        // Twitch mirrors its heading into a tooltip; a clone would carry the
+        // wrong one.
+        if (title.hasAttribute('title')) title.setAttribute('title', group.label);
+      }
 
       const header = block.querySelector(PSEL.header);
       if (header) {
@@ -1307,18 +1733,20 @@
         // are inert in a clone and would otherwise sit there doing nothing.
         header.querySelectorAll('button, [role="dialog"], [data-toggle-balloon-id]')
           .forEach(el => el.remove());
-        const title = header.querySelector('strong');
-        if (title) title.textContent = group.label;
-        const avatar = header.querySelector('img');
-        if (avatar) {
-          avatar.src = badgeIcon(group.letter, group.color);
-          avatar.removeAttribute('srcset');
-          avatar.alt = group.label;
+        // No avatar. The channel section we clone from carries one, and a
+        // generated stand-in read as a foreign object next to Twitch's real
+        // profile pictures. "Frequently Used" proves a section needs no image,
+        // so the slot goes entirely...
+        header.querySelectorAll('.emote-grid-section__header-image').forEach(el => el.remove());
+        // ...along with the layout divs that spaced it and held the report
+        // control, which are now empty and would otherwise leave the title
+        // indented by a gap with nothing in it. Matched by being empty rather
+        // than by class, since those classes are per-deploy build hashes.
+        for (const el of Array.from(header.querySelectorAll('div')).reverse()) {
+          if (!el.firstElementChild && !(el.textContent || '').trim()) el.remove();
         }
       }
 
-      const grid = block.querySelector(PSEL.grid);
-      if (!grid) return null;
       grid.textContent = '';
       // A popular channel can carry several hundred 7TV emotes. Building them
       // all in one go blocks the frame the picker opens on, so only the first
@@ -1393,8 +1821,10 @@
       picker.dataset.uteHover = '1';
       const at = e => {
         if (!e.target || !e.target.closest) return null;
-        // Both the cell and its image carry data-ute-code, so closest() may
-        // land on either one.
+        // Only the cell carries data-ute-code — buildCell deliberately keeps it
+        // off the image, since that attribute is what counts cells and drives
+        // the search filter. So closest() lands on the cell and the image is
+        // one step down; the IMG branch is there in case that ever changes.
         const hit = e.target.closest('[data-ute-code]');
         if (!hit) return null;
         return hit.tagName === 'IMG' ? hit : hit.querySelector('img');
@@ -1405,7 +1835,10 @@
 
     /**
      * Twitch filters its own sections through React state, which never sees
-     * our nodes, so we filter them ourselves off the same input.
+     * our nodes, so we filter them ourselves off the same input. Marked so a
+     * re-check doesn't stack a second listener on the same element — and
+     * re-attached automatically when Twitch replaces the element, since a fresh
+     * one arrives without the mark.
      */
     wireSearch(picker) {
       const input = picker.querySelector(PSEL.search);
@@ -1425,6 +1858,8 @@
         });
         section.style.display = shown ? '' : 'none';
       }
+      // Nothing to do about the status row here: it exists only while the box is
+      // empty, so a query can never be hiding one. inject() owns its presence.
     },
 
     /** The channel's own tab: the one avatar-style item we can safely clone. */
@@ -1473,6 +1908,7 @@
         const item = source.cloneNode(true);
         item.classList.add('ute-nav-item');
         item.dataset.uteNav = group.provider;
+        item.removeAttribute('id');
         item.querySelectorAll('[id]').forEach(el => el.removeAttribute('id'));
         // The channel tab may well be the active one, and its active classes
         // would otherwise come along with the clone — which is why every tab
@@ -1612,23 +2048,30 @@
     .ute-card img { height: 28px; width: auto; max-width: 64px; object-fit: contain; }
     .ute-card-code { font-weight: 600; }
     .ute-card-src { color: #adadb8; }
-    /* above the chat box */
-    .ute-bubble { position: absolute; bottom: calc(100% + 6px); inset-inline-start: 10px; z-index: 20; }
+    /* above the chat box — measured, see Composer.showBubble */
+    .ute-bubble { position: fixed; z-index: 2147483000; }
     /* beside whatever emote is hovered */
     .ute-tip { position: fixed; z-index: 2147483000; }
     .ute-panel {
-      display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
-      margin: 4px 0 2px; padding: 6px 10px;
+      display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px;
+      margin: 4px 0 0; padding: 6px 10px 0;
       font: 11px/1.5 Inter, Roobert, Helvetica, sans-serif; color: #adadb8;
     }
-    .ute-panel-counts { color: #efeff1; }
-    .ute-panel-channel { margin-inline-end: auto; }
     .ute-panel button {
-      all: unset; padding: 2px 8px; border-radius: 3px; cursor: pointer;
+      all: unset; display: inline-block; white-space: nowrap;
+      padding: 2px 8px; border-radius: 3px; cursor: pointer;
       border: 1px solid rgba(255, 255, 255, .14); color: #dedee3; font: inherit;
     }
+    /* No max-width or text-overflow on the channel button: the name is already
+       cut to length in labelPanel, where a limit in characters can actually be
+       expressed. nowrap above keeps each button whole, so a row that outgrows
+       the picker breaks between buttons rather than inside one. */
     .ute-panel button:hover { background: rgba(255, 255, 255, .08); }
     .ute-panel button:focus-visible { outline: 2px solid #bf94ff; outline-offset: 1px; }
+    /* No styling hangs off aria-pressed. The word in the label already says
+       which state the toggle is in, and a colour saying it a second time only
+       raises the question of which of the three controls is special. The
+       attribute stays for screen readers, which have no label to read twice. */
     .ute-nav-item { position: relative; }
     .ute-nav-tag {
       position: absolute; bottom: 1px; left: 50%; transform: translateX(-50%);
@@ -1639,28 +2082,107 @@
     }
   `);
 
+  /**
+   * The CSS Custom Highlight API styles arbitrary Ranges with no DOM mutation,
+   * which is the one thing that lets the composer hide a code without covering
+   * it: `color: transparent` on exactly those characters. The alternative — and
+   * the fallback below — is painting an opaque box over them in a colour guessed
+   * from the input's ancestors, which is wrong over a gradient or an image.
+   *
+   * Only paint properties are available here; the spec excludes anything that
+   * affects layout, precisely so a highlight can never reflow text. So this
+   * hides a code. It cannot narrow one.
+   */
+  const HIGHLIGHT_NAME = 'ute-composer-code';
+  const HIGHLIGHTS = typeof Highlight === 'function'
+    && typeof CSS !== 'undefined' && !!(CSS && CSS.highlights);
+
+  addStyle(`
+    ::highlight(${HIGHLIGHT_NAME}) { color: transparent; text-shadow: none; }
+  `);
+
   const Composer = {
     editable: null,
     box: null,
     layer: null,
+    bubble: null,
     hostObserver: null,
     contentObserver: null,
+    host: null,
+    onFocusIn: null,
     handlers: null,
     queued: false,
     composing: false,
+    // Set while the overlay is blanked for a live selection, so the pass that
+    // clears the selection still runs even if focus has left the editable by
+    // then — otherwise the emotes never come back. See the selectionchange
+    // handler and render().
+    selectionHidden: false,
 
     start() {
       if (!CONFIG.composerPreview || this.hostObserver) return;
       if (!/(^|\.)twitch\.tv$/i.test(location.hostname)) return;
       const host = document.querySelector('.chat-input') || document.body;
       if (!host) return;
-      this.hostObserver = new MutationObserver(() => this.attach());
+      // Repaint as well as re-attach: the overlay and the bubble are both
+      // measured, and anything mounting in this subtree — the reply-thread
+      // tray above all — moves the box they are measured against.
+      //
+      // Records from our own layer are dropped, and that is not an
+      // optimisation. The layer is a child of the box, which is inside the
+      // host: every repaint replaces its tokens, those removals and insertions
+      // arrive back here as mutations, and scheduling on them paints again.
+      // Unfiltered that is a loop running once a frame for as long as the box
+      // holds a code — which is also what kept the bubble's image pinned to its
+      // first frame, since each turn of it rewrote the card. Nothing inside the
+      // layer can move the box the layer is measured against, so there is
+      // nothing in those records worth waking up for.
+      this.hostObserver = new MutationObserver(muts => {
+        if (this.layer && muts.every(m => this.layer.contains(m.target))) return;
+        this.attach();
+        this.schedule();
+      });
       this.hostObserver.observe(host, { childList: true, subtree: true });
+
+      // Moving the caret from one composer to the other changes no markup, so
+      // the observer above cannot see it and target() would keep returning the
+      // editable that was focused when the last mutation happened. focusin
+      // bubbles, so one listener on the host covers every composer under it,
+      // and attach() costs nothing on the passes where the target is unchanged.
+      this.host = host;
+      this.onFocusIn = () => this.attach();
+      host.addEventListener('focusin', this.onFocusIn);
+
       this.attach();
     },
 
+    /**
+     * The composer being typed into, which is not always the first one in the
+     * tree. Twitch's reply-thread tray brings its own editable, and both carry
+     * the same hooks — so a plain querySelector binds whichever the markup
+     * happens to put first, which was how a reply could be typed with no
+     * preview under it at all.
+     *
+     * Focus is the right tiebreak rather than a second overlay, because only
+     * one of them can be typed into: the state this module maintains is one
+     * layer, one bubble and one measured box, and there is nothing to preview
+     * in a composer nobody is writing in. Where the choice is unambiguous —
+     * one editable, or none focused yet — this reads exactly as before.
+     *
+     * Spellcheck deliberately does the opposite and writes to every match. The
+     * difference is what is being maintained: an attribute is per element and
+     * costs nothing to hold on all of them, an overlay is a live measurement of
+     * one box against one caret.
+     */
+    target() {
+      const all = document.querySelectorAll(PSEL.input);
+      if (all.length < 2) return all[0] || null;
+      const active = document.activeElement;
+      return Array.from(all).find(el => el === active || el.contains(active)) || all[0];
+    },
+
     attach() {
-      const editable = document.querySelector(PSEL.input);
+      const editable = this.target();
       if (!editable) { this.detach(); return; }
       if (editable === this.editable && this.layer && this.layer.isConnected) return;
       this.detach();
@@ -1680,16 +2202,17 @@
       this.layer = layer;
 
       if (CONFIG.composerBubble) {
-        // Anchored outside the clipping layer, and to .chat-input rather than
-        // the text box, so a clipped input can't swallow it.
-        const anchor = editable.closest('.chat-input') || box;
-        if (getComputedStyle(anchor).position === 'static') anchor.style.position = 'relative';
+        // On document.body, fixed and measured — never parented to a Twitch
+        // element. It used to hang off .chat-input with bottom: 100%, which
+        // needed .chat-input made into a containing block and put the card
+        // above whatever else that element happened to contain. With the
+        // reply-thread tray open, that is the height of the entire thread.
         const bubble = document.createElement('div');
         bubble.className = 'ute-card ute-bubble';
         bubble.setAttribute('aria-hidden', 'true');
         bubble.innerHTML = '<img alt=""><span class="ute-card-code"></span>' +
                            '<span class="ute-card-src"></span>';
-        anchor.appendChild(bubble);
+        document.body.appendChild(bubble);
         this.bubble = bubble;
       }
 
@@ -1704,33 +2227,50 @@
         scroll: () => this.schedule(),
         compositionstart: () => { this.composing = true; this.clear(); },
         compositionend: () => { this.composing = false; this.schedule(); },
-        selectionchange: () => { if (this.editable === document.activeElement) this.schedule(); },
+        selectionchange: () => {
+          // The activeElement test alone is too narrow now that a selection
+          // blanks the overlay. A drag that starts in the message list and ends
+          // in the box never makes the editable active, and a click elsewhere
+          // that clears such a selection makes it inactive before we hear about
+          // it — so the state the overlay needs to leave would be the one state
+          // that never scheduled a pass out of itself.
+          if (this.editable === document.activeElement
+              || this.selectionHidden
+              || this.selectionActive()) this.schedule();
+        },
+        resize: () => this.schedule(),
       };
       editable.addEventListener('scroll', this.handlers.scroll, { passive: true });
       editable.addEventListener('compositionstart', this.handlers.compositionstart);
       editable.addEventListener('compositionend', this.handlers.compositionend);
       document.addEventListener('selectionchange', this.handlers.selectionchange);
+      window.addEventListener('resize', this.handlers.resize, { passive: true });
 
       this.schedule();
       log('composer preview attached');
     },
 
     detach() {
+      this.setHighlight(null);
       if (this.contentObserver) { this.contentObserver.disconnect(); this.contentObserver = null; }
       if (this.editable && this.handlers) {
         this.editable.removeEventListener('scroll', this.handlers.scroll);
         this.editable.removeEventListener('compositionstart', this.handlers.compositionstart);
         this.editable.removeEventListener('compositionend', this.handlers.compositionend);
         document.removeEventListener('selectionchange', this.handlers.selectionchange);
+        window.removeEventListener('resize', this.handlers.resize);
       }
       if (this.layer && this.layer.parentNode) this.layer.parentNode.removeChild(this.layer);
       if (this.bubble && this.bubble.parentNode) this.bubble.parentNode.removeChild(this.bubble);
       this.editable = this.box = this.layer = this.bubble = this.handlers = null;
+      this.selectionHidden = false;
     },
 
     reset() {
       this.detach();
       if (this.hostObserver) { this.hostObserver.disconnect(); this.hostObserver = null; }
+      if (this.host && this.onFocusIn) this.host.removeEventListener('focusin', this.onFocusIn);
+      this.host = this.onFocusIn = null;
     },
 
     schedule() {
@@ -1739,8 +2279,23 @@
       requestAnimationFrame(() => { this.queued = false; try { this.render(); } catch (e) { log('composer', e.message); } });
     },
 
+    /**
+     * Hand the painted codes' ranges to the highlight registry, or drop the entry
+     * when there are none. Rebuilt from scratch on every pass: Slate replaces the
+     * editable's text nodes on each keystroke, so yesterday's ranges are detached
+     * and simply stop painting.
+     */
+    setHighlight(ranges) {
+      if (!HIGHLIGHTS) return;
+      try {
+        if (ranges && ranges.length) CSS.highlights.set(HIGHLIGHT_NAME, new Highlight(...ranges));
+        else CSS.highlights.delete(HIGHLIGHT_NAME);
+      } catch (e) { log('highlight', e.message); }
+    },
+
     clear() {
       if (this.layer) this.layer.replaceChildren();
+      this.setHighlight(null);
       this.showBubble(null);
     },
 
@@ -1752,15 +2307,48 @@
     showBubble(info) {
       const bubble = this.bubble;
       if (!bubble) return;
-      if (!info) { bubble.classList.remove('ute-on'); return; }
-      bubble.querySelector('img').src = info.url;
-      bubble.querySelector('img').alt = info.code;
-      bubble.querySelector('.ute-card-code').textContent = info.code;
-      bubble.querySelector('.ute-card-src').textContent = info.label;
-      bubble.classList.add('ute-on');
+      // The code is deliberately left on the node when the card is hidden, so
+      // coming back to the same emote costs no new image request and resumes
+      // the animation rather than restarting it.
+      if (!info || !this.box) { bubble.classList.remove('ute-on'); return; }
+
+      /**
+       * The one card in the script that was showing a still, and the reason is
+       * how often it is written rather than what it is written with.
+       *
+       * render() runs on every keystroke, every selection change and every
+       * repaint, and calls this on each pass. Assigning src re-runs the image
+       * request even when the value is identical — it is the standard way to
+       * restart a GIF — so an animated emote was being sent back to frame one
+       * faster than it could reach frame two. The hover cards escaped it only
+       * by being written once per mouseover.
+       *
+       * Guarding the write on the code fixes it for good rather than for a
+       * particular repaint cadence: the picture is now built once per emote and
+       * left alone, however many passes go over it.
+       */
+      if (bubble.dataset.uteCode !== info.code) {
+        bubble.dataset.uteCode = info.code;
+        const img = bubble.querySelector('img');
+        img.alt = info.code;
+        img.src = info.url;
+        bubble.querySelector('.ute-card-code').textContent = info.code;
+        bubble.querySelector('.ute-card-src').textContent = info.label;
+      }
+      bubble.classList.add('ute-on');       // measure only once it's laid out
+
+      // Measured against the text box itself, so it sits above the field you
+      // are typing in wherever that field happens to be on the page.
+      placeCard(bubble, this.box.getBoundingClientRect(), { align: 'start' });
     },
 
-    /** First non-transparent background above the input, to mask the text. */
+    /**
+     * First non-transparent background above the input, to mask the text with.
+     *
+     * A guess, and the reason highlights are preferred where available: it walks
+     * ancestors for a solid colour and has nothing sensible to return over a
+     * gradient or an image. Only reached when the highlight API is missing.
+     */
     background() {
       let el = this.box;
       for (let i = 0; el && i < 6; i++, el = el.parentElement) {
@@ -1809,16 +2397,70 @@
       return { node, offset };
     },
 
+    /**
+     * True while a non-collapsed selection overlaps the composer.
+     *
+     * Scoped to selections that actually reach the box: selecting a line out of
+     * the message list is not a reason to blank the thing you are typing into.
+     * intersectsNode rather than a check on the anchor, so a selection that
+     * spans the box without either end landing in it — select-all, or a drag
+     * from above it to below — counts too.
+     */
+    selectionActive() {
+      const el = this.editable;
+      if (!el) return false;
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+      for (let i = 0; i < sel.rangeCount; i++) {
+        const r = sel.getRangeAt(i);
+        try { if (r.intersectsNode(el)) return true; }
+        catch (e) { if (el.contains(r.startContainer) || el.contains(r.endContainer)) return true; }
+      }
+      return false;
+    },
+
     render() {
       if (!this.editable || !this.layer || this.composing) return;
       if (!Store.map.size) { this.clear(); return; }
+
+      /**
+       * A live selection takes the overlay down entirely.
+       *
+       * This is the one state where the picture and the code it stands for were
+       * both visible at once. The composer hides a code with `color:
+       * transparent` rather than by removing it, and the browser paints
+       * selected text in the selection's own colours — selection outranks a
+       * custom highlight — so the moment a code fell inside a selection its
+       * characters came back underneath the emote already drawn over them.
+       *
+       * Blanking is the answer rather than extending the mask, and the script
+       * already argued the case: a code under the caret gives up its picture so
+       * that it can be edited as text. A selected code is being handled as text
+       * for the same kind of reason — to be copied, replaced or deleted — and
+       * the same answer follows. It also leaves the selection reading exactly
+       * as the message will send, and puts the highlight rectangles back around
+       * the characters they belong to instead of around a picture.
+       *
+       * All of it goes, not only the codes inside the selection. A selection is
+       * a transient thing you are looking at deliberately, the state lasts as
+       * long as a drag, and a box that is half pictures and half codes reads
+       * worse than one that is briefly all text.
+       */
+      if (this.selectionActive()) {
+        this.selectionHidden = true;
+        this.clear();
+        return;
+      }
+      this.selectionHidden = false;
 
       const raw = (this.editable.textContent || '').replace(/\uFEFF/g, '');
       if (!raw.trim()) { this.clear(); return; }
 
       const boxRect = this.box.getBoundingClientRect();
       const caret = this.caretToken();
-      const bg = this.background();
+      // Only needed for the masking fallback; skipped entirely, along with its
+      // six getComputedStyle calls, where highlights hide the text instead.
+      const bg = HIGHLIGHTS ? '' : this.background();
       const frag = document.createDocumentFragment();
 
       const walker = document.createTreeWalker(this.editable, NodeFilter.SHOW_TEXT, {
@@ -1836,6 +2478,7 @@
 
       let node;
       let caretMatch = null;
+      const hidden = [];
       while ((node = walker.nextNode())) {
         const value = node.nodeValue;
         const re = /\S+/g;
@@ -1854,38 +2497,231 @@
           const range = document.createRange();
           range.setStart(node, start);
           range.setEnd(node, end);
-          const rects = range.getClientRects();
-          // A code split across two lines has two rects; leave it as text
-          // rather than paint a box in the wrong place.
-          if (rects.length !== 1) continue;
-          const r = rects[0];
-          if (!r.width || !r.height) continue;
+          const rects = Array.from(range.getClientRects())
+            .filter(r => r.width > 0 && r.height > 0);
+          if (!rects.length) continue;
 
-          const token = document.createElement('span');
-          token.className = 'ute-composer-token';
-          token.dataset.uteCode = match[0];
-          token.style.left = (r.left - boxRect.left) + 'px';
-          token.style.top = (r.top - boxRect.top) + 'px';
-          token.style.width = r.width + 'px';
-          token.style.height = r.height + 'px';
-          token.style.background = bg;
+          // One rect per line the code occupies. Codes long enough to wrap are
+          // common — 7TV has several past fifty characters — and abandoning
+          // them left the raw code sitting in the box as text.
+          //
+          // The widest fragment gets the picture. The rejected alternative was
+          // slicing the image across the break the way the text itself breaks:
+          // the halves cannot line up, because the fragment widths come from the
+          // text and bear no relation to the emote's own aspect ratio, and a
+          // picture cut in two reads as broken rather than as wrapped. A blank
+          // tail on the shorter fragment does not, and the boxes still occupy
+          // exactly the space the text did, so nothing reflows.
+          let host = 0;
+          for (let i = 1; i < rects.length; i++) {
+            if (rects[i].width > rects[host].width) host = i;
+          }
 
-          const img = document.createElement('img');
-          img.src = emote.url;
-          if (emote.srcset) img.srcset = emote.srcset;
-          img.alt = match[0];
-          token.appendChild(img);
-          frag.appendChild(token);
+          // One range covers every fragment at once, so a wrapped code needs no
+          // per-fragment bookkeeping to be hidden.
+          hidden.push(range);
+
+          for (let i = 0; i < rects.length; i++) {
+            // Without highlights each fragment needs its own opaque box. With
+            // them the text is already invisible, so only the fragment carrying
+            // the picture needs a node at all.
+            if (i !== host && HIGHLIGHTS) continue;
+            const r = rects[i];
+            const token = document.createElement('span');
+            token.className = 'ute-composer-token';
+            token.dataset.uteCode = match[0];
+            token.style.left = (r.left - boxRect.left) + 'px';
+            token.style.top = (r.top - boxRect.top) + 'px';
+            token.style.width = r.width + 'px';
+            token.style.height = r.height + 'px';
+            if (bg) token.style.background = bg;
+            if (i === host) {
+              const img = document.createElement('img');
+              img.src = emote.url;
+              if (emote.srcset) img.srcset = emote.srcset;
+              img.alt = match[0];
+              token.appendChild(img);
+            }
+            frag.appendChild(token);
+          }
         }
       }
 
       this.layer.replaceChildren(frag);
+      this.setHighlight(hidden);
       this.showBubble(caretMatch);
     },
   };
 
   /* ══════════════════════════════════════════════════════════════════════════
-   * 10. MENU COMMANDS
+   * 10. SPELLCHECK SUPPRESSION  (twitch.tv only)
+   *
+   * The browser's dictionary has never heard of catJAM or peepoHappy, so every
+   * third-party code in the chat box picks up a misspelling underline. Section
+   * 9 then paints the emote over those characters without removing them — it
+   * hides them with `color: transparent`, and a spelling marker is not the
+   * text's colour, so it survives underneath the picture. The result reads as
+   * a red squiggle under the emote itself.
+   *
+   * Two things could be done about that and only one of them is honest:
+   *
+   *   - Suppress the marker. One attribute, no layout, nothing to keep in
+   *     sync, and the underline is gone from the codes Twitch leaves as text
+   *     as well as from the ones we paint over.
+   *   - Cover the marker up. It is drawn below the baseline, outside the
+   *     glyph box the composer measures, so hiding it would mean guessing at
+   *     an inflated box and masking a strip of whatever is behind the input —
+   *     the same guess `background()` already documents as its weak point,
+   *     made in a place where being wrong is visible on every line.
+   *
+   * So: the `spellcheck` attribute on the editable. It is inherited by every
+   * descendant, so one write covers the whole message including text Slate
+   * re-renders later, and it is a presentational hint the editor never reads.
+   * Slate's model, its serialiser, and the message that actually gets sent are
+   * all untouched — which is the same contract §9 holds itself to, and for the
+   * same reason: nothing here may change what other people receive.
+   *
+   * This is the third and last place the script writes to Twitch's own DOM,
+   * and it is held to the terms of the other two. One attribute. Written only
+   * when it differs from what we want, so a pass over an already-correct
+   * editable is free and our own write cannot start a loop. Re-asserted every
+   * time rather than assumed to have held. Restored to whatever Twitch had
+   * when the toggle goes back off — recorded per element in a WeakMap rather
+   * than in a data attribute, because a marker of our own on their node is one
+   * more write than this needs.
+   *
+   * React does not fight it. It writes DOM attributes by diffing this render's
+   * props against the previous render's, not against the DOM, so a re-render
+   * carrying an unchanged `spellCheck` prop leaves our value alone. A remount
+   * is different — that element arrives new, with Twitch's value on it — and
+   * catching it is what the attribute filter on the observer is for.
+   * ════════════════════════════════════════════════════════════════════════ */
+
+  const PREF_SPELLCHECK = 'ute:spellcheck-off';
+
+  const Spellcheck = {
+    observer: null,
+    queued: false,
+    // element → the value Twitch had before we first touched it. null records
+    // "no attribute at all", which is not the same as "false" and restores
+    // differently. A WeakMap so a torn-down editable is not kept alive by us.
+    original: new WeakMap(),
+
+    /**
+     * True when suppression is active. The stored choice wins over CONFIG,
+     * which is only the default for someone who has never touched the toggle —
+     * so editing CONFIG later will not silently override a decision the user
+     * has already made, and clearing the key restores CONFIG as the answer.
+     */
+    off() {
+      const stored = gmGet(PREF_SPELLCHECK, null);
+      return stored === null ? !!CONFIG.disableSpellcheck : !!stored;
+    },
+
+    set(off) {
+      gmSet(PREF_SPELLCHECK, !!off);
+      this.apply();
+      // Both surfaces carry the state in their labels, so both are told.
+      Menu.register();
+      Picker.syncPanel();
+      log('spellcheck', off ? 'suppressed in the chat box' : 'left to the browser');
+    },
+
+    toggle() { this.set(!this.off()); },
+
+    /**
+     * Every composer on the page, not just the main one. Twitch's reply-thread
+     * tray mounts a second editable with the same hooks, and a reply is where
+     * emote codes get typed as often as anywhere.
+     */
+    editors() {
+      return Array.from(document.querySelectorAll(PSEL.input));
+    },
+
+    apply() {
+      if (!isTwitch()) return;
+      const off = this.off();
+      for (const el of this.editors()) {
+        // Recorded before the first write and never afterwards, so a pass that
+        // runs while our own value is on the element cannot mistake it for
+        // Twitch's.
+        if (!this.original.has(el)) {
+          this.original.set(el, el.hasAttribute('spellcheck') ? el.getAttribute('spellcheck') : null);
+        }
+        if (off) {
+          if (el.getAttribute('spellcheck') !== 'false') el.setAttribute('spellcheck', 'false');
+          continue;
+        }
+        const was = this.original.get(el);
+        if (was === null) {
+          if (el.hasAttribute('spellcheck')) el.removeAttribute('spellcheck');
+        } else if (el.getAttribute('spellcheck') !== was) {
+          el.setAttribute('spellcheck', was);
+        }
+      }
+    },
+
+    start() {
+      if (!isTwitch() || this.observer) return;
+      // Same host as the picker and the composer watch, and for the same
+      // reason: .chat-input sees almost no churn, document.body sees every
+      // incoming message.
+      const host = document.querySelector('.chat-input') || document.body;
+      if (!host) return;
+
+      // childList catches Twitch mounting a new editable — a reply tray
+      // opening, a remount after a re-render. The attribute filter catches the
+      // narrower case of the value being written back on an element we already
+      // hold. Our own writes come back through here too and settle on the next
+      // pass, because apply() only writes when the value differs.
+      this.observer = new MutationObserver(() => this.schedule());
+      this.observer.observe(host, {
+        childList: true, subtree: true,
+        attributes: true, attributeFilter: ['spellcheck'],
+      });
+
+      this.apply();
+      log('spellcheck control attached;', this.off() ? 'suppressed' : 'left alone');
+    },
+
+    schedule() {
+      if (this.queued) return;
+      this.queued = true;
+      requestAnimationFrame(() => { this.queued = false; this.apply(); });
+    },
+
+    /**
+     * Nothing is restored here. A channel change tears the editable down and
+     * builds another, so there is no attribute left to put back — and the
+     * preference outlives the navigation by design. start() re-attaches to the
+     * new chat shell on the next boot.
+     */
+    reset() {
+      if (this.observer) { this.observer.disconnect(); this.observer = null; }
+    },
+
+    /**
+     * Both toggles are labelled from here. The label states the browser's
+     * behaviour ("Spellcheck: on") rather than the action, matching how the
+     * manager menu's other entries carry their state; aria-pressed, the tooltip
+     * and the accessible name supply the action, since "on" alone does not say
+     * what clicking the control would do.
+     */
+    labelButton(b) {
+      const off = this.off();
+      b.textContent = `Spellcheck: ${off ? 'off' : 'on'}`;
+      b.setAttribute('aria-pressed', off ? 'true' : 'false');
+      const hint = off
+        ? 'Spellcheck is off in the chat box. Click to turn it back on.'
+        : 'Spellcheck is on in the chat box. Click to turn it off.';
+      b.title = hint;
+      b.setAttribute('aria-label', hint);
+    },
+  };
+
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   * 11. MENU COMMANDS
    *
    * The two controls that have to exist everywhere — switch channel, reload
    * emotes — live in the userscript manager's own menu rather than in a
@@ -1931,6 +2767,15 @@
       try {
         this.ids.push(GM_registerMenuCommand(`Set channel — ${channel}`, promptForChannel));
         this.ids.push(GM_registerMenuCommand(`Reload emotes — ${total} loaded`, forceReload));
+        // Only where there is a chat box to act on. The other two entries are
+        // useful on any page this script has found chat on; this one would be
+        // a control that does nothing visible, which is the failure the panel
+        // this menu replaced was retired for.
+        if (isTwitch()) {
+          this.ids.push(GM_registerMenuCommand(
+            `Chat box spellcheck — currently ${Spellcheck.off() ? 'off' : 'on'}`,
+            () => Spellcheck.toggle()));
+        }
       } catch (e) { log('menu registration failed:', e.message); }
     },
 
@@ -1945,7 +2790,7 @@
 
 
   /* ══════════════════════════════════════════════════════════════════════════
-   * 11. BOOTSTRAP
+   * 12. BOOTSTRAP
    * ════════════════════════════════════════════════════════════════════════ */
 
   function shouldRunHere() {
@@ -1967,7 +2812,7 @@
 
     Menu.register();
     Renderer.attach(root, messages);
-    if (profile === 'twitch') { Picker.start(); Composer.start(); }
+    if (profile === 'twitch') { Picker.start(); Composer.start(); Spellcheck.start(); }
 
     const login = resolveChannel();
     if (!login) {
@@ -1975,6 +2820,10 @@
            'Set it from the userscript manager menu, or add a channelOverrides entry.');
     }
     await Store.load(login);
+    // Kept even though adopt() normally does this. It is the path where adopt
+    // correctly declines — a reload of the same channel with an unchanged
+    // signature — that still needs it, because the root attached above is new
+    // and has never been walked with a populated map.
     Renderer.reprocessAll();
   }
 
@@ -1988,16 +2837,28 @@
     GenericDetector.start((root) => boot(root, null));
   }
 
+  // Held so a channel change replaces this watcher rather than stacking a
+  // second one over the same document, each with its own three-minute timer.
+  let chatWatcher = null;
+  let chatWatcherTimer = 0;
+
+  function stopWatchingForChat() {
+    if (chatWatcher) { chatWatcher.disconnect(); chatWatcher = null; }
+    if (chatWatcherTimer) { clearTimeout(chatWatcherTimer); chatWatcherTimer = 0; }
+  }
+
   function watchForChat() {
+    stopWatchingForChat();
     scan();
     if (booted) return;
     const obs = new MutationObserver(() => {
-      if (booted) { obs.disconnect(); return; }
+      if (booted) { stopWatchingForChat(); return; }
       scan();
     });
     obs.observe(document.documentElement, { childList: true, subtree: true });
+    chatWatcher = obs;
     // Hard stop so idle tabs don't keep an observer alive forever.
-    setTimeout(() => obs.disconnect(), 180000);
+    chatWatcherTimer = setTimeout(stopWatchingForChat, 180000);
   }
 
   // SPA navigation: Twitch swaps channels without a page load.
@@ -2011,6 +2872,7 @@
         Renderer.detachAll();
         Picker.reset();
         Composer.reset();
+        Spellcheck.reset();
         booted = false;
         setTimeout(watchForChat, 500);
         Store.load(next);
