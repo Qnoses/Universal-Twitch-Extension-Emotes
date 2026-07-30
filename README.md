@@ -135,8 +135,13 @@ script tries, in order:
 2. The URL — `/popout/<ch>/chat`, `/embed/<ch>/chat`, `/moderator/<ch>`, a bare
    `/<ch>` that isn't a reserved Twitch path, or the `?channel=` parameter that
    nearly every embed and overlay widget takes.
-3. On `twitch.tv` only, a walk up React's fiber tree from the chat input looking
-   for a `channelLogin` prop.
+3. On `twitch.tv` only, a walk up React's fiber tree from the chat input
+   looking for a prop named for a channel — `channelLogin`, `channelName`,
+   `channel.login`. A bare `login` is accepted only as a last resort, and only
+   once every seed has been searched for something more specific: the
+   components around a chat input carry the viewer as well as the channel, so
+   `login` on one of those is your own account rather than the one you are
+   watching.
 4. `data-channel` / `data-room` attributes, then the parent frame's URL.
 
 Turning that login into a user ID normally means a Twitch API client ID. It
@@ -147,13 +152,25 @@ no room entry.
 
 If nothing resolves, the script still loads the three global sets and says so:
 the picker's **Channel** button reads `N/A` and its tooltip says detection
-failed, and clicking it takes the name by hand, remembered for that page. Off
+failed, and clicking it takes the name by hand, remembered for that page. That
+same `N/A` shows briefly during a channel change, since the button reports the
+channel whose emotes are actually loaded and there is a moment where that is
+none — so it doubles as a sign that a load is still in flight. Off
 Twitch, where there is no picker, the same control sits in your userscript
 manager's menu — which also shows the current channel and emote count in its
 labels.
 
 Setting a channel takes effect immediately, including when its emotes are
 already cached from an earlier visit.
+
+Changing channel also discards whatever was already in flight for the last one.
+A single load can legitimately take the better part of a minute — three ID
+resolvers tried in sequence, fifteen seconds allowed each — which is long enough
+to give up on a page and navigate away, and a result arriving after that used to
+overwrite the channel you had moved to. If a load turns up nothing at all, which
+takes a network failure across all three providers at once, it is retried once
+ten seconds later rather than leaving the script with an empty emote map for the
+life of the page.
 
 ## Sections in the emote picker
 
@@ -250,8 +267,9 @@ see these buttons and never tries to reconcile them.
 
 Type a 7TV, BetterTTV or FrankerFaceZ code and it becomes the emote right there
 in the input, the way BetterTTV does it. Before you type the space that commits
-it, a small card above the box shows the emote, its name and which provider it
-came from, so you can see what you're about to send.
+it, a small card above the code shows the emote, its name and which provider it
+came from, so you can see what you're about to send — in the same place relative
+to what you are typing that Twitch puts its own preview.
 
 Twitch already does this for its own emotes when you're logged in — that's what
 the rich input is for. It simply has no idea what a 7TV code is. This fills in
@@ -443,10 +461,12 @@ on detection would turn up on ordinary sites too.
   in a colour guessed by walking the input's ancestors for a solid one — which
   is the guess the highlight replaces, since it has no good answer over a
   gradient or an image.
-- The preview card hangs off `document.body` and is placed by measuring the
-  input box, so no element of Twitch's is turned into a positioning context.
-  An earlier version anchored it to `.chat-input` instead, which put the card
-  above the whole reply-thread tray whenever a thread was open.
+- The preview card hangs off `document.body` and is positioned by measuring the
+  code it is previewing, so no element of Twitch's is turned into a positioning
+  context. Where a code is long enough to wrap it is measured against the first
+  line it occupies, so the card holds one position for as long as you are typing
+  that code. An earlier version anchored it to `.chat-input` instead, which put
+  the card above the whole reply-thread tray whenever a thread was open.
 - Its own overlays, cards and panels are excluded from chat processing, so the
   script never renders into its own output — and the composer ignores its own
   repaints, which are mutations inside the region it watches.

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      3.0
+// @version      3.1
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -344,6 +344,23 @@
     const seeds = document.querySelectorAll(
       '[data-a-target="chat-input"], .chat-shell, .stream-chat, [data-a-target="chat-scroller"]'
     );
+    const ok = c => typeof c === 'string' && /^[a-z0-9_]{3,25}$/i.test(c);
+
+    /**
+     * Anything named for a channel is taken at face value. A bare `login` is
+     * not, and it is the one prop here that can name the wrong person: the
+     * components around a chat input carry the *viewer* as well as the channel
+     * — chat identity, badges, the reply composer — and `login` on one of those
+     * is your own account, not the one you are watching.
+     *
+     * So it is demoted rather than trusted or dropped. It stays as a last
+     * resort for renderers that expose nothing better, but it is only returned
+     * once every seed has been searched for something specific. Taking the
+     * first match of either kind, as this did, let a generic hit low in one
+     * seed's tree beat a `channelLogin` sitting further up.
+     */
+    let loose = null;
+
     for (const seed of seeds) {
       let node = seed.wrappedJSObject || seed;
       for (let up = 0; node && up < 20; up++, node = node.parentElement) {
@@ -355,13 +372,14 @@
         for (let i = 0; i < 80 && fiber; i++, fiber = fiber.return) {
           const p = fiber.memoizedProps;
           if (!p) continue;
-          const c = p.channelLogin || p.channelName || p.login
+          const named = p.channelLogin || p.channelName
             || (p.channel && (p.channel.login || p.channel.name));
-          if (typeof c === 'string' && /^[a-z0-9_]{3,25}$/i.test(c)) return c.toLowerCase();
+          if (ok(named)) return named.toLowerCase();
+          if (!loose && ok(p.login)) loose = p.login.toLowerCase();
         }
       }
     }
-    return null;
+    return loose;
   }
 
   function channelFromDom() {
@@ -436,20 +454,47 @@
     counts: {},
     signature: '',
 
+    /**
+     * Bumped whenever the page moves to a different channel. A load carries the
+     * epoch it started under and is refused if that has moved on since.
+     *
+     * The signature guard cannot do this job. It asks whether a result is the
+     * same as what we already hold, which is the right question for a refresh
+     * and the wrong one for a result that arrived too late: a load for the
+     * channel you *left* is different from what we hold, so it was accepted and
+     * overwrote the channel you are actually on. That is not a narrow window
+     * either — request() allows 15s per call and resolveTwitchId tries three
+     * resolvers in sequence, so a single load can legitimately stay in flight
+     * for the better part of a minute, which is long enough to give up on a
+     * page and navigate away.
+     */
+    epoch: 0,
+    retriedFor: -1,
+
+    /** The page has moved on: nothing already in flight may adopt. */
+    invalidate() {
+      this.epoch++;
+      // Cleared as well as invalidated. Leaving it would keep the old name in
+      // the panel and the menu, and in the case that actually matters — the new
+      // load also failing — it would stay there for good.
+      this.channel = null;
+    },
+
     async load(login) {
+      const gen = this.epoch;
       const cacheKey = `ute:emotes:${login || '__global__'}`;
       const cached = gmGet(cacheKey, null);
       const age = cached ? Date.now() - cached.ts : Infinity;
       if (cached && age < CONFIG.cacheTTL) {
         log('cache hit', login, cached.emotes.length);
-        this.adopt(cached.emotes, login);
+        this.adopt(cached.emotes, login, gen);
         // Only reach out again once the cache is genuinely ageing. Refreshing
         // on every page view meant six API calls per Twitch tab for emotes we
         // already had.
-        if (age > CONFIG.cacheTTL / 2) setTimeout(() => this.fetchAll(login, cacheKey), 5000);
+        if (age > CONFIG.cacheTTL / 2) setTimeout(() => this.fetchAll(login, cacheKey, gen), 5000);
         return;
       }
-      await this.fetchAll(login, cacheKey);
+      await this.fetchAll(login, cacheKey, gen);
     },
 
     /**
@@ -470,7 +515,11 @@
      * the second of those is now recognised as the no-op it is instead of
      * rebuilding every section a second time.
      */
-    adopt(emotes, login) {
+    adopt(emotes, login, gen = this.epoch) {
+      if (gen !== this.epoch) {
+        log('discarded a late load for', login, '— the page has moved on');
+        return false;
+      }
       if (this.channel === login && emoteSignature(emotes) === this.signature) {
         log('emotes unchanged; nothing to rebuild');
         // Still worth a pass: the labels carry the channel, and a first load on
@@ -490,7 +539,7 @@
       return true;
     },
 
-    async fetchAll(login, cacheKey) {
+    async fetchAll(login, cacheKey, gen = this.epoch) {
       const { providers } = CONFIG;
       let ffzRoom = null;
       let channelId = null;
@@ -523,13 +572,29 @@
         else log('provider failed:', s.reason && s.reason.message);
       }
 
-      if (!emotes.length) { warn('no emotes resolved for', login); return; }
+      if (!emotes.length) {
+        warn('no emotes resolved for', login);
+        // Without this the script sits with an empty map for the life of the
+        // page — no sections, no nav tabs, no control row, and a channel that
+        // reads as undetected because Store.channel is only ever written by a
+        // successful adopt. Nothing recovers on its own, and a reload during
+        // the same blip fails the same way, so the state outlasts its cause.
+        //
+        // One retry, once per epoch, and only if the page has not moved on.
+        if (gen === this.epoch && this.retriedFor !== gen) {
+          this.retriedFor = gen;
+          setTimeout(() => {
+            if (gen === this.epoch) this.fetchAll(login, cacheKey, gen);
+          }, 10000);
+        }
+        return;
+      }
 
       // Slide the cache forward regardless, so a refresh that found nothing
       // new still buys another full TTL of quiet.
       gmSet(cacheKey, { ts: Date.now(), emotes });
 
-      this.adopt(emotes, login);
+      this.adopt(emotes, login, gen);
     },
 
     ingest(emotes) {
@@ -2304,7 +2369,7 @@
      * with a space yet, so it stays editable text and gets a card instead.
      * The same rule that keeps the caret's token unpainted drives this.
      */
-    showBubble(info) {
+    showBubble(info, codeRect) {
       const bubble = this.bubble;
       if (!bubble) return;
       // The code is deliberately left on the node when the card is hidden, so
@@ -2337,9 +2402,24 @@
       }
       bubble.classList.add('ute-on');       // measure only once it's laid out
 
-      // Measured against the text box itself, so it sits above the field you
-      // are typing in wherever that field happens to be on the page.
-      placeCard(bubble, this.box.getBoundingClientRect(), { align: 'start' });
+      /**
+       * Anchored to the code itself, both axes.
+       *
+       * On a message long enough to wrap this puts the card over the line above
+       * the one being typed, which looks like a drawback and is not: it is what
+       * Twitch's own emote preview does, so it is the behaviour a Twitch user
+       * already expects. Matching it is worth more than keeping the whole field
+       * clear — an expectation met beats a line of your own text visible, and
+       * the card is dismissed by the same keystroke that finishes the code.
+       *
+       * Where a code is long enough to wrap, it is anchored to the first
+       * fragment rather than to whichever one holds the caret, so the card
+       * keeps one position for the whole time you are typing that code. With
+       * no rect to work from this falls back to the corner of the box rather
+       * than guessing.
+       */
+      placeCard(bubble, codeRect || this.box.getBoundingClientRect(),
+                codeRect ? {} : { align: 'start' });
     },
 
     /**
@@ -2478,6 +2558,7 @@
 
       let node;
       let caretMatch = null;
+      let caretRect = null;
       const hidden = [];
       while ((node = walker.nextNode())) {
         const value = node.nodeValue;
@@ -2491,6 +2572,23 @@
           const end = start + match[0].length;
           if (caret && caret.node === node && caret.offset >= start && caret.offset <= end) {
             caretMatch = emote;
+            // Measured even though this code is deliberately not painted: the
+            // preview card is anchored to it, and without a rect it has nothing
+            // to sit over but the corner of the box.
+            //
+            // The first fragment, always. A wrapped code has one rect per line
+            // it touches, and following the caret between them would slide the
+            // card up and down as you typed through a single word. Anchoring to
+            // where the code begins is both stable and uniform — every code
+            // previews in the same place relative to itself. It reads well for
+            // the wrapped case too: a code long enough to wrap is longer than a
+            // line, so the browser starts it on a fresh one, and that first
+            // fragment is a full line with the card centred over it.
+            const cr = document.createRange();
+            cr.setStart(node, start);
+            cr.setEnd(node, end);
+            caretRect = Array.from(cr.getClientRects())
+              .find(r => r.width > 0 && r.height > 0) || null;
             continue;
           }
 
@@ -2549,7 +2647,7 @@
 
       this.layer.replaceChildren(frag);
       this.setHighlight(hidden);
-      this.showBubble(caretMatch);
+      this.showBubble(caretMatch, caretRect);
     },
   };
 
@@ -2873,6 +2971,9 @@
         Picker.reset();
         Composer.reset();
         Spellcheck.reset();
+        // Before the new load starts, so anything still in flight for the
+        // channel we are leaving can no longer adopt over the top of it.
+        Store.invalidate();
         booted = false;
         setTimeout(watchForChat, 500);
         Store.load(next);
