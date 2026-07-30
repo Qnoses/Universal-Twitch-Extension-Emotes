@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Universal Twitch Extension Emotes (BTTV / FFZ / 7TV)
 // @namespace    https://github.com/Qnoses
-// @version      3.1
+// @version      3.2
 // @description  Renders BetterTTV, FrankerFaceZ and 7TV emotes in any Twitch chat, wherever that chat is rendered — twitch.tv itself, embedded chat iframes on third-party sites, popout chat, OBS browser sources, KapChat, and generic tmi.js chat widgets — by detecting chat structurally rather than by hostname. Also adds the channel's BTTV/FFZ/7TV emotes as sections in Twitch's own emote picker.
 // @author       Qnoses
 // @license      MIT
@@ -666,40 +666,137 @@
    * Replaces the browser's `title` tooltip on rendered emotes with the same
    * card the chat box uses, so an emote reads the same wherever you meet it.
    */
+  /**
+   * The two preview cards.
+   *
+   * The hover card over a rendered emote and the composer's card for the code
+   * under the caret are the same object with different anchors, and they were
+   * built twice — the same markup string in two places, two src writes, two
+   * change-guards. That is how they drifted: the composer's copy ended up
+   * setting src without srcset, which on an ordinary display meant it asked for
+   * a different file from every other image of that emote on the page, and so
+   * missed the cache every time while the hover card was instant. A difference
+   * neither function could show on its own.
+   *
+   * They cannot share an element — a caret can sit in a code while the pointer
+   * is over a chat emote, so both can be open at once — but everything about
+   * what a card *is* lives here, and callers supply only the emote and where to
+   * put it.
+   */
+  function makeCard(variant) {
+    const el = document.createElement('div');
+    el.className = `ute-card ute-${variant}`;
+    el.setAttribute('aria-hidden', 'true');
+    el.innerHTML = '<img alt=""><span class="ute-card-code"></span>' +
+                   '<span class="ute-card-src"></span>';
+    document.body.appendChild(el);
+
+    const pic = el.querySelector('img');
+    const codeEl = el.querySelector('.ute-card-code');
+    const srcEl = el.querySelector('.ute-card-src');
+    let token = 0;
+
+    return {
+      el,
+
+      /**
+       * @param {string} code    the emote's code, shown and used as alt text
+       * @param {string} label   the provider, shown beneath it
+       * @param {string} src     the file to display
+       * @param {string} srcset  density set, or '' for a file chosen already
+       * @param {Function} ready called once the picture is up, to re-place the
+       *                         card: one that has not loaded measures narrower
+       *                         than the one the user ends up looking at
+       */
+      show(code, label, src, srcset, ready) {
+        codeEl.textContent = code;
+        srcEl.textContent = label;
+        pic.alt = code;
+
+        // Keyed on the pair, not on the code: the picture is what a rewrite
+        // costs, and two sites can hold the same code at different URLs — a
+        // blob standing in for a CSP-blocked one, say. Rewriting src re-runs
+        // the request even for an identical value, which is the standard way
+        // to restart a GIF, so an animated emote would never leave frame one.
+        const set = srcset || '';
+        if (pic.getAttribute('src') !== src || (pic.getAttribute('srcset') || '') !== set) {
+          // Hidden until the picture it is named after arrives. Assigning src
+          // does not clear what the element is painting, so the card would
+          // otherwise show the previous emote under the new one's name, both
+          // of which are already written above.
+          //
+          // Tokened rather than fired blind: a pointer crossing several emotes,
+          // or a caret moving through several codes, leaves earlier loads in
+          // flight, and the one that finishes last need not be the one shown.
+          const mine = ++token;
+          const reveal = () => {
+            if (mine !== token) return;
+            pic.classList.add('ute-loaded');
+            if (ready) ready();
+          };
+          pic.classList.remove('ute-loaded');
+          pic.onload = reveal;
+          pic.onerror = reveal;      // a broken emote still shows its name
+
+          if (set) pic.srcset = set; else pic.removeAttribute('srcset');
+          pic.src = src;
+
+          // An image already in the browser's list of available ones is
+          // complete before any handler could run, which is the common case
+          // here — the card usually names an emote the page is already
+          // showing. Without this it would blank for a frame first.
+          if (pic.complete && pic.naturalWidth) reveal();
+        }
+        el.classList.add('ute-on');  // measure only once it's laid out
+      },
+
+      hide() { el.classList.remove('ute-on'); },
+      place(rect, opts) { placeCard(el, rect, opts); },
+    };
+  }
+
   const Tooltip = {
-    el: null,
+    card: null,
 
     ensure() {
-      if (this.el && this.el.isConnected) return this.el;
-      const el = document.createElement('div');
-      el.className = 'ute-card ute-tip';
-      el.setAttribute('aria-hidden', 'true');
-      el.innerHTML = '<img alt=""><span class="ute-card-code"></span>' +
-                     '<span class="ute-card-src"></span>';
-      document.body.appendChild(el);
-      this.el = el;
-      return el;
+      if (!this.card || !this.card.el.isConnected) this.card = makeCard('tip');
+      return this.card;
     },
 
     show(img, below) {
-      const el = this.ensure();
-      const src = img.currentSrc || img.src;
-      const pic = el.querySelector('img');
-      // Written only when it changes. Assigning the same value to src re-runs
-      // the image request, and an animated emote comes back from that at its
-      // first frame — so a card refreshed while it is already open shows a
-      // still. See Composer.showBubble, where that refresh is constant.
-      if (pic.getAttribute('src') !== src) pic.src = src;
-      el.querySelector('.ute-card-code').textContent = img.dataset.uteCode || img.alt || '';
-      el.querySelector('.ute-card-src').textContent = img.dataset.uteSrc || '';
-      el.classList.add('ute-on');            // measure only once it's laid out
+      const card = this.ensure();
+
+      /**
+       * currentSrc is the file this image actually resolved to, which is what
+       * makes the hover card free: it is already decoded, so the card paints
+       * with it immediately. It is also the only thing that survives a CSP
+       * repair, where src still names the blocked URL and currentSrc holds the
+       * blob that replaced it — so it is preferred whenever it exists, and
+       * passed with no srcset because the choice has already been made.
+       *
+       * It does not always exist. A lazily-loaded chat emote scrolled back to
+       * has not resolved anything yet, and src alone is the wrong file there:
+       * srcset picks by device pixel ratio, so on an ordinary display the page
+       * will show the 1x entry while src names whatever CONFIG.size says.
+       * Handing over both makes the card resolve exactly as its source will.
+       */
+      const live = img.currentSrc;
 
       // In the picker Twitch puts its own tooltip below the emote; in chat
       // there is rarely room below, so that stays above.
-      placeCard(el, img.getBoundingClientRect(), { below });
+      const place = () => card.place(img.getBoundingClientRect(), { below });
+
+      card.show(
+        img.dataset.uteCode || img.alt || '',
+        img.dataset.uteSrc || '',
+        live || img.src,
+        live ? '' : (img.getAttribute('srcset') || ''),
+        place,
+      );
+      place();
     },
 
-    hide() { if (this.el) this.el.classList.remove('ute-on'); },
+    hide() { if (this.card) this.card.hide(); },
   };
 
   /**
@@ -2111,6 +2208,11 @@
     }
     .ute-card.ute-on { display: flex; }
     .ute-card img { height: 28px; width: auto; max-width: 64px; object-fit: contain; }
+    /* An <img> keeps painting its old picture until the replacement decodes, so
+       a card whose text has already changed would show the previous emote under
+       the new one's name. Both cards gate on this; for the hover card the image
+       is almost always already available, so it reveals in the same tick. */
+    .ute-card img:not(.ute-loaded) { visibility: hidden; }
     .ute-card-code { font-weight: 600; }
     .ute-card-src { color: #adadb8; }
     /* above the chat box — measured, see Composer.showBubble */
@@ -2170,12 +2272,13 @@
     editable: null,
     box: null,
     layer: null,
-    bubble: null,
+    card: null,
     hostObserver: null,
     contentObserver: null,
     host: null,
     onFocusIn: null,
     handlers: null,
+    bubbleAnchor: null,
     queued: false,
     composing: false,
     // Set while the overlay is blanked for a live selection, so the pass that
@@ -2272,13 +2375,7 @@
         // needed .chat-input made into a containing block and put the card
         // above whatever else that element happened to contain. With the
         // reply-thread tray open, that is the height of the entire thread.
-        const bubble = document.createElement('div');
-        bubble.className = 'ute-card ute-bubble';
-        bubble.setAttribute('aria-hidden', 'true');
-        bubble.innerHTML = '<img alt=""><span class="ute-card-code"></span>' +
-                           '<span class="ute-card-src"></span>';
-        document.body.appendChild(bubble);
-        this.bubble = bubble;
+        this.card = makeCard('bubble');
       }
 
       // Read-only observation: Slate re-renders the editable on every
@@ -2326,9 +2423,10 @@
         window.removeEventListener('resize', this.handlers.resize);
       }
       if (this.layer && this.layer.parentNode) this.layer.parentNode.removeChild(this.layer);
-      if (this.bubble && this.bubble.parentNode) this.bubble.parentNode.removeChild(this.bubble);
-      this.editable = this.box = this.layer = this.bubble = this.handlers = null;
+      if (this.card && this.card.el.parentNode) this.card.el.parentNode.removeChild(this.card.el);
+      this.editable = this.box = this.layer = this.card = this.handlers = null;
       this.selectionHidden = false;
+      this.bubbleAnchor = null;
     },
 
     reset() {
@@ -2370,37 +2468,8 @@
      * The same rule that keeps the caret's token unpainted drives this.
      */
     showBubble(info, codeRect) {
-      const bubble = this.bubble;
-      if (!bubble) return;
-      // The code is deliberately left on the node when the card is hidden, so
-      // coming back to the same emote costs no new image request and resumes
-      // the animation rather than restarting it.
-      if (!info || !this.box) { bubble.classList.remove('ute-on'); return; }
-
-      /**
-       * The one card in the script that was showing a still, and the reason is
-       * how often it is written rather than what it is written with.
-       *
-       * render() runs on every keystroke, every selection change and every
-       * repaint, and calls this on each pass. Assigning src re-runs the image
-       * request even when the value is identical — it is the standard way to
-       * restart a GIF — so an animated emote was being sent back to frame one
-       * faster than it could reach frame two. The hover cards escaped it only
-       * by being written once per mouseover.
-       *
-       * Guarding the write on the code fixes it for good rather than for a
-       * particular repaint cadence: the picture is now built once per emote and
-       * left alone, however many passes go over it.
-       */
-      if (bubble.dataset.uteCode !== info.code) {
-        bubble.dataset.uteCode = info.code;
-        const img = bubble.querySelector('img');
-        img.alt = info.code;
-        img.src = info.url;
-        bubble.querySelector('.ute-card-code').textContent = info.code;
-        bubble.querySelector('.ute-card-src').textContent = info.label;
-      }
-      bubble.classList.add('ute-on');       // measure only once it's laid out
+      if (!this.card) return;
+      if (!info || !this.box) { this.card.hide(); return; }
 
       /**
        * Anchored to the code itself, both axes.
@@ -2418,8 +2487,27 @@
        * no rect to work from this falls back to the corner of the box rather
        * than guessing.
        */
-      placeCard(bubble, codeRect || this.box.getBoundingClientRect(),
-                codeRect ? {} : { align: 'start' });
+      this.bubbleAnchor = codeRect || null;
+
+      // srcset as well as url, so this resolves to the same file as every other
+      // image of the emote on the page — chat, the picker cells and this
+      // module's own tokens all go through it, and srcset picks by device pixel
+      // ratio rather than by CONFIG.size.
+      this.card.show(info.code, info.label, info.url, info.srcset,
+                     () => this.placeBubble());
+      this.placeBubble();
+    },
+
+    /**
+     * Kept separate from showBubble so the image's load handler can re-run it.
+     * The card is measured to place it, and a card whose picture has not
+     * arrived yet measures narrower than the one the user ends up looking at.
+     */
+    placeBubble() {
+      if (!this.card || !this.box) return;
+      const anchor = this.bubbleAnchor;
+      this.card.place(anchor || this.box.getBoundingClientRect(),
+                      anchor ? {} : { align: 'start' });
     },
 
     /**
@@ -2589,6 +2677,31 @@
             cr.setEnd(node, end);
             caretRect = Array.from(cr.getClientRects())
               .find(r => r.width > 0 && r.height > 0) || null;
+
+            // When the code has scrolled out of the box, only the vertical
+            // anchor is given up. Twitch arranges this by itself: clicking into
+            // a composer long enough to scroll snaps it to the bottom, leaving
+            // the caret in a code that is no longer on screen. The token for
+            // that code is clipped away by the layer, which is `overflow:
+            // hidden` over exactly this rectangle — but the card sits on
+            // document.body where nothing clips it, so it was left pointing at
+            // a line the reader could not see.
+            //
+            // Vertical scrolling does not move a code sideways, so its
+            // horizontal position is still exactly right and worth keeping: the
+            // card stays over the column the code occupies and only rises to
+            // clear the box, which reads as the same card having slid rather
+            // than as a different card in the corner.
+            //
+            // Tested against boxRect on purpose, so the card gives up its line
+            // at exactly the point the painted emote would vanish.
+            if (caretRect &&
+                (caretRect.bottom <= boxRect.top || caretRect.top >= boxRect.bottom)) {
+              caretRect = {
+                top: boxRect.top, bottom: boxRect.bottom,
+                left: caretRect.left, width: caretRect.width,
+              };
+            }
             continue;
           }
 

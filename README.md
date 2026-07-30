@@ -55,7 +55,7 @@ emotes, cosmetics, settings panes, chat tooling. Plenty of people install one
 for a single part of that — seeing the emotes everyone else is using — and take
 the rest as freight.
 
-This is that one part, in a single file of about 2,900 commented lines you can
+This is that one part, in a single file of about 3,000 commented lines you can
 read end to end before deciding to trust it. There's no bundle to unpack, no
 build step, no background service worker sitting in your browser between
 sessions, and no permissions beyond whatever your userscript manager already
@@ -379,8 +379,13 @@ changes.
 
 **Emotes**
 
-- `size` (default `'2x'`) — emote scale requested from each CDN, `1x`–`4x`.
-  BetterTTV only serves up to `3x` and clamps automatically.
+- `size` (default `'2x'`) — the emote scale asked of each CDN, `1x`–`4x`.
+  BetterTTV only serves up to `3x` and clamps automatically. Note that every
+  emote image also carries a `srcset` of all available scales, and the browser
+  picks from that by device pixel ratio — so on an ordinary display the file
+  actually shown is the `1x` one whatever this is set to. What it does control
+  is the `src` these fall back to, which is the copy fetched when an image has
+  to be re-requested through the userscript bridge past a strict `img-src`.
 - `maxHeight` (default `28`) — rendered cap in CSS pixels, matching Twitch's own
   emote height.
 - `providers` (default all `true`) — `sevenTV`, `bttv`, `ffz`. Switching one off
@@ -522,6 +527,12 @@ that scale with emote count are bounded too:
   a load that turns out to change nothing does no work at all: no re-ingest, no
   picker rebuild, no composer repaint. That covers a background refresh and the
   second of the two loads a channel change performs alike.
+- Every emote image on the page — chat, picker cells, the codes painted in the
+  chat box, and both preview cards — is built from one `srcset`, so all of them
+  resolve to the same file and a card costs nothing beyond what the page has
+  already fetched. A card that named its file directly instead would miss on
+  every emote, since the browser's pick is by device pixel ratio rather than by
+  the name.
 - Changing the labels in the picker's control row re-labels them in place. A
   rebuild would be the obvious way, and on a channel with several hundred 7TV
   emotes it means discarding thousands of cells to change one word.
